@@ -1,3 +1,7 @@
+// Koegaki change notice (Apache License 2.0, section 4(b)): this file was changed for Koegaki on
+// branch koegaki-bias of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: `init(from:)` is
+// public, so a caller can copy the state before a decode it may repeat.
+
 @preconcurrency import CoreML
 import Foundation
 
@@ -62,7 +66,9 @@ public struct TdtDecoderState: Sendable {
         cellState = decoderOutput.featureValue(for: "c_out")?.multiArrayValue ?? cellState
     }
 
-    init(from other: TdtDecoderState) throws {
+    /// A copy of `other` that shares no array with it: the decoder writes a state's LSTM arrays in
+    /// place, so a decode that may be repeated from where it started decodes a copy.
+    public init(from other: TdtDecoderState) throws {
         hiddenState = try MLMultiArray(shape: other.hiddenState.shape, dataType: .float32)
         cellState = try MLMultiArray(shape: other.cellState.shape, dataType: .float32)
         lastToken = other.lastToken

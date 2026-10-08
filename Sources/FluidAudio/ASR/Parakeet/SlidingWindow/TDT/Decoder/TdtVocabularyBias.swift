@@ -1,3 +1,7 @@
+// Koegaki change notice (Apache License 2.0, section 4(b)): this file was added for Koegaki on
+// branch koegaki-bias of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: the decode-time
+// vocabulary bias for the TDT v3 greedy decoder.
+
 import Foundation
 
 /// Decode-time custom vocabulary biasing for the TDT v3 greedy decoder.

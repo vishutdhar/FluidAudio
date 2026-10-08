@@ -1,3 +1,7 @@
+// Koegaki change notice (Apache License 2.0, section 4(b)): this file was added for Koegaki on
+// branch koegaki-bias of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: unit tests
+// of the decode-time vocabulary bias.
+
 import XCTest
 
 @testable import FluidAudio
@@ -34,9 +38,12 @@ final class TdtVocabularyBiasTests: XCTestCase {
 
     func testNoUsableTermsBuildsNothing() {
         let short = CustomVocabularyTerm(text: "ab", tokenIds: nil)
-        XCTAssertNil(TdtVocabularyBias(terms: [short], vocabulary: vocab, blankId: blankId, boost: 1, shape: .pieceTrie))
-        XCTAssertNil(TdtVocabularyBias(terms: [short], vocabulary: vocab, blankId: blankId, boost: 1, shape: .contextGraph))
-        XCTAssertNil(TdtVocabularyBias(terms: [siobhan], vocabulary: vocab, blankId: blankId, boost: 0, shape: .pieceTrie))
+        XCTAssertNil(
+            TdtVocabularyBias(terms: [short], vocabulary: vocab, blankId: blankId, boost: 1, shape: .pieceTrie))
+        XCTAssertNil(
+            TdtVocabularyBias(terms: [short], vocabulary: vocab, blankId: blankId, boost: 1, shape: .contextGraph))
+        XCTAssertNil(
+            TdtVocabularyBias(terms: [siobhan], vocabulary: vocab, blankId: blankId, boost: 0, shape: .pieceTrie))
     }
 
     func testPieceTrieOpensOnlyWithTwoLetters() {

@@ -1,3 +1,7 @@
+// Koegaki change notice (Apache License 2.0, section 4(b)): this file was changed for Koegaki on
+// branch koegaki-bias of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: the decode-time
+// vocabulary bias setter and builder, and worker clones that carry the bias.
+
 import AVFoundation
 @preconcurrency import CoreML
 import Foundation
