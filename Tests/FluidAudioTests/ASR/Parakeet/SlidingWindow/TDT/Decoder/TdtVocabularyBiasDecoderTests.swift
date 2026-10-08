@@ -128,6 +128,27 @@ final class TdtVocabularyBiasDecoderTests: XCTestCase {
         XCTAssertEqual(moved.tokenDurations, [2])
     }
 
+    /// Hold-frame wins over the decoder's same-frame guard: when a token was already emitted at the
+    /// frame with duration 0, a later flip to a shorter piece at that frame still holds it, so the
+    /// audio the shorter piece did not spell is decoded.
+    func testHoldFrameAfterAnEmissionAtTheSameFrame() async throws {
+        let (hypothesis, joint) = try await decode(frames: 4, bias: bias([terminal])) { frame, last in
+            switch (frame, last) {
+            case (0, blank):
+                return ScriptedJointStep(token: 8, probability: 0.8, durationBin: 0, topK: [(8, 5), (9, 1)])
+            case (0, 8):
+                return ScriptedJointStep(token: 18, probability: 0.8, durationBin: 2, topK: [(18, 5), (16, 3.5)])
+            case (0, 16):
+                return ScriptedJointStep(token: 17, probability: 0.8, durationBin: 1, topK: [(17, 5), (8, 1)])
+            default: return blankStep()
+            }
+        }
+        XCTAssertEqual(Array(hypothesis.ySequence.prefix(2)), [8, 16], "\" termin\" flipped to \" Ter\"")
+        XCTAssertEqual(Array(joint.frames.prefix(3)), [0, 0, 0], "the frame is held after the shorter flip")
+        XCTAssertEqual(hypothesis.ySequence, [8, 16, 17])
+        XCTAssertEqual(hypothesis.timestamps, [0, 0, 0])
+    }
+
     /// A token before the emission cutoff is suppressed, yet it reached the LSTM, so it advances the
     /// graph: after a suppressed " Si" the next arc of Siobhan is still boosted.
     func testASuppressedTokenAdvancesTheGraph() async throws {

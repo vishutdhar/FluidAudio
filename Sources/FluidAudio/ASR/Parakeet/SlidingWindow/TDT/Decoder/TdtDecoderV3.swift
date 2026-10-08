@@ -319,7 +319,6 @@ internal struct TdtDecoderV3: Sendable {
             // durationBins typically = [0,1,2,3,4] meaning skip 0-4 frames
             var duration = try TdtDurationMapping.mapDurationBin(
                 decision.durationBin, durationBins: config.tdtConfig.durationBins)
-            if biasHoldsFrame { duration = 0 }
             var blankMask = (label == blankId)  // Is this a blank (silence) token?
 
             let currentTimeIndex = timeIndices
@@ -330,6 +329,10 @@ internal struct TdtDecoderV3: Sendable {
             {
                 duration = 1
             }
+            // Hold-frame wins over that guard: a flip to a shorter piece must decode the audio it did
+            // not spell, even at a frame that already emitted. The force-blank cap below still bounds
+            // the emissions at one frame.
+            if biasHoldsFrame { duration = 0 }
 
             // Prevent infinite loops when blank has duration=0.
             if blankMask && duration == 0 {
