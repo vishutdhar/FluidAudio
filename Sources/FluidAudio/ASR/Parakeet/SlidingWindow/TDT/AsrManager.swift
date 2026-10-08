@@ -108,9 +108,31 @@ public actor AsrManager {
         }
     }
 
-    internal func makeWorkerClone() -> AsrManager? {
+    internal func makeWorkerClone() async -> AsrManager? {
         guard let models = asrModels else { return nil }
-        return AsrManager(config: config, models: models)
+        let clone = AsrManager(config: config, models: models)
+        await clone.setVocabularyBias(vocabularyBias)
+        return clone
+    }
+
+    /// Decode-time custom vocabulary bias for the v3 TDT decoder; `nil` decodes exactly as before.
+    internal var vocabularyBias: TdtVocabularyBias?
+
+    /// Sets (or clears, with `nil`) the decode-time vocabulary bias used by every following
+    /// transcription on this manager, its chunk workers included.
+    public func setVocabularyBias(_ bias: TdtVocabularyBias?) {
+        vocabularyBias = bias
+    }
+
+    /// Builds a bias over this manager's loaded piece table.
+    public func makeVocabularyBias(
+        terms: [CustomVocabularyTerm], boost: Float, shape: TdtVocabularyBias.Shape,
+        freshStartMinLetters: Int = 2, holdFrameOnShorterFlip: Bool = false
+    ) -> TdtVocabularyBias? {
+        let blankId = asrModels?.version.blankId ?? config.tdtConfig.blankId
+        return TdtVocabularyBias(
+            terms: terms, vocabulary: vocabulary, blankId: blankId, boost: boost, shape: shape,
+            freshStartMinLetters: freshStartMinLetters, holdFrameOnShorterFlip: holdFrameOnShorterFlip)
     }
 
     /// Returns the current transcription progress stream for offline long audio (>240,000 samples / ~15s).
@@ -330,7 +352,8 @@ public actor AsrManager {
                 vocabulary: vocabulary,
                 punctuationTokenIds: punctuationTokenIds,
                 emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
-                initialTimeIndexOverride: initialTimeIndexOverride
+                initialTimeIndexOverride: initialTimeIndexOverride,
+                vocabularyBias: vocabularyBias
             )
         case .tdtJa:
             // The Japanese model outputs Kanji / Hiragana / Katakana, none of

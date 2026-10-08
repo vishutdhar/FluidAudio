@@ -114,7 +114,8 @@ internal struct TdtDecoderV3: Sendable {
         vocabulary: [Int: String]? = nil,
         punctuationTokenIds: Set<Int>? = nil,
         emitTokensAfterGlobalFrame: Int? = nil,
-        initialTimeIndexOverride: Int? = nil
+        initialTimeIndexOverride: Int? = nil,
+        vocabularyBias: TdtVocabularyBias? = nil
     ) async throws -> TdtHypothesis {
         // Early exit for very short audio (< 160ms)
         guard encoderSequenceLength > 1 else {
@@ -127,7 +128,9 @@ internal struct TdtDecoderV3: Sendable {
         // Script-filtering consumes top-K; skip the extraction when the caller
         // didn't provide a language (default path), so v3 joint runs don't pay
         // for K-length array allocations they'll never use.
-        let needsTopK = language != nil
+        // The vocabulary bias reads the same top-K; with no bias and no language nothing changes.
+        let needsTopK = language != nil || vocabularyBias != nil
+        var biasState = vocabularyBias?.makeState() ?? TdtVocabularyBias.State()
 
         // Build a stride-aware view so we can access encoder frames without extra copies
         let encoderFrames = try EncoderFrameView(
@@ -282,6 +285,15 @@ internal struct TdtDecoderV3: Sendable {
 
             let blankId = config.tdtConfig.blankId  // 8192 for v3 models
 
+            // Vocabulary bias, before the script filter. Never past a blank argmax.
+            var biasHoldsFrame = false
+            if let bias = vocabularyBias, label != blankId,
+                let ids = decision.topKIds, let logits = decision.topKLogits
+            {
+                biasHoldsFrame = bias.apply(
+                    label: &label, score: &score, topKIds: ids, topKLogits: logits, state: &biasState)
+            }
+
             Self.tokenLanguageFilter(
                 label: &label,
                 score: &score,
@@ -303,6 +315,7 @@ internal struct TdtDecoderV3: Sendable {
             // durationBins typically = [0,1,2,3,4] meaning skip 0-4 frames
             var duration = try TdtDurationMapping.mapDurationBin(
                 decision.durationBin, durationBins: config.tdtConfig.durationBins)
+            if biasHoldsFrame { duration = 0 }
             var blankMask = (label == blankId)  // Is this a blank (silence) token?
 
             let currentTimeIndex = timeIndices
@@ -369,6 +382,14 @@ internal struct TdtDecoderV3: Sendable {
                 label = innerDecision.token
                 score = TdtDurationMapping.clampProbability(innerDecision.probability)
 
+                var innerHoldsFrame = false
+                if let bias = vocabularyBias, label != blankId,
+                    let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits
+                {
+                    innerHoldsFrame = bias.apply(
+                        label: &label, score: &score, topKIds: ids, topKLogits: logits, state: &biasState)
+                }
+
                 Self.tokenLanguageFilter(
                     label: &label,
                     score: &score,
@@ -389,6 +410,7 @@ internal struct TdtDecoderV3: Sendable {
 
                 duration = try TdtDurationMapping.mapDurationBin(
                     innerDecision.durationBin, durationBins: config.tdtConfig.durationBins)
+                if innerHoldsFrame { duration = 0 }
 
                 blankMask = (label == blankId)
 
@@ -430,6 +452,7 @@ internal struct TdtDecoderV3: Sendable {
                     hypothesis.suppressedTimestamps.append(emissionTimestamp)
                 }
                 hypothesis.lastToken = label  // Remember for next iteration
+                vocabularyBias?.observe(label, state: &biasState)
 
                 // CRITICAL: Update decoder LSTM with the new token
                 // This updates the language model context for better predictions
@@ -561,6 +584,7 @@ internal struct TdtDecoderV3: Sendable {
                         hypothesis.suppressedTimestamps.append(finalTimestamp)
                     }
                     hypothesis.lastToken = token
+                    vocabularyBias?.observe(token, state: &biasState)
 
                     // Update decoder state
                     let step = try modelInference.runDecoder(
