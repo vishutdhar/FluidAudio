@@ -1,6 +1,7 @@
 // Koegaki change notice (Apache License 2.0, section 4(b)): this file was changed for Koegaki on
 // branch koegaki-bias of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: the decode-time
-// vocabulary bias at the two script filter sites, hold-frame, and top-K read when a bias needs it.
+// vocabulary bias at the two script filter sites, hold-frame, top-K read when a bias needs it, and the
+// bias's completion rollback.
 
 /// Token-and-Duration Transducer (TDT) Decoder
 ///
@@ -233,145 +234,98 @@ internal struct TdtDecoderV3: Sendable {
         let maxSymbolsPerStep = config.tdtConfig.maxSymbolsPerStep  // Usually 5-10
         var tokensProcessedThisChunk = 0  // Track tokens per chunk to prevent runaway decoding
 
-        // ===== MAIN DECODING LOOP =====
-        // Process each encoder frame until we've consumed all audio
-        while activeMask {
-            try Task.checkCancellation()
-            // Use last emitted token for decoder context, or blank if starting
-            var label = hypothesis.lastToken ?? config.tdtConfig.blankId
-            let stateToUse = hypothesis.decState ?? decoderState
-
-            // Get decoder output (LSTM hidden state projection)
-            // OPTIMIZATION: Use cached output if available to avoid redundant computation
-            // This cache is valid when decoder state hasn't changed
-            let decoderResult: (output: MLFeatureProvider, newState: TdtDecoderState)
-            if let cached = decoderState.predictorOutput {
-                // Reuse cached decoder output - significant speedup
-                let provider = try MLDictionaryFeatureProvider(dictionary: [
-                    "decoder": MLFeatureValue(multiArray: cached)
-                ])
-                decoderResult = (output: provider, newState: stateToUse)
-            } else {
-                // No cache - run decoder LSTM
-                decoderResult = try modelInference.runDecoder(
-                    token: label,
-                    state: stateToUse,
-                    model: decoderModel,
-                    targetArray: reusableTargetArray,
-                    targetLengthArray: reusableTargetLengthArray
-                )
+        // Completion rollback (`TdtVocabularyBias.completionRollback`): each step's starting point is
+        // kept, and the one where a flip arms is held until its term completes. When the match breaks
+        // or the chunk ends first, the decode returns there, and that step takes its plain argmax.
+        // Only with no language set: the script filter runs after the bias and can replace a flip,
+        // which the rollback does not model, so with a language the bias decodes as without it.
+        let watchesFlips = language == nil && (vocabularyBias?.watchesFlips ?? false)
+        var stepStart: RollbackPoint? = nil
+        var rollbackPoint: RollbackPoint? = nil
+        var rollbacks = 0
+        /// Returns to `point`, where the step `veto` (by default the waiting flip's) takes its plain argmax.
+        func restore(_ point: RollbackPoint, vetoing veto: Int? = nil) {
+            let flip = veto ?? biasState.pendingFlip
+            var vetoes = biasState.vetoedDecisions
+            if let flip { vetoes.insert(flip) }
+            hypothesis = point.hypothesis
+            // The decoder writes the LSTM arrays in place, so the point's values go back into them.
+            let lstm = hypothesis.decState ?? decoderState
+            lstm.hiddenState.copyData(from: point.hidden)
+            lstm.cellState.copyData(from: point.cell)
+            decoderState.predictorOutput = point.predictorOutput
+            timeIndices = point.timeIndices
+            safeTimeIndices = point.safeTimeIndices
+            activeMask = point.activeMask
+            timeIndicesCurrentLabels = point.timeIndicesCurrentLabels
+            lastEmissionTimestamp = point.lastEmissionTimestamp
+            emissionsAtThisTimestamp = point.emissionsAtThisTimestamp
+            tokensProcessedThisChunk = point.tokensProcessedThisChunk
+            biasState = point.biasState
+            biasState.vetoedDecisions = vetoes
+            rollbacks += 1
+            if tdtBiasLogEnabled {
+                FileHandle.standardError.write(Data("tdt-bias-rollback: step \(flip ?? -1)\n".utf8))
             }
+        }
 
-            // Prepare decoder projection once and reuse for inner blank loop
-            let decoderProjection = try extractFeatureValue(
-                from: decoderResult.output, key: "decoder", errorMessage: "Invalid decoder output")
-            try modelInference.normalizeDecoderProjection(decoderProjection, into: reusableDecoderStep)
-
-            // Run joint network with preallocated inputs
-            let decision = try modelInference.runJointPrepared(
-                encoderFrames: encoderFrames,
-                timeIndex: safeTimeIndices,
-                preparedDecoderStep: reusableDecoderStep,
-                model: jointModel,
-                encoderStep: reusableEncoderStep,
-                encoderDestPtr: encDestPtr,
-                encoderDestStride: encDestStride,
-                inputProvider: jointInput,
-                tokenIdBacking: tokenIdBacking,
-                tokenProbBacking: tokenProbBacking,
-                durationBacking: durationBacking,
-                needsTopK: needsTopK
-            )
-
-            // Predict token (what to emit) and duration (how many frames to skip)
-            label = decision.token
-            var score = TdtDurationMapping.clampProbability(decision.probability)
-
-            let blankId = config.tdtConfig.blankId  // 8192 for v3 models
-
-            // Vocabulary bias, before the script filter. Never past a blank argmax.
-            var biasHoldsFrame = false
-            if let bias = vocabularyBias, label != blankId,
-                let ids = decision.topKIds, let logits = decision.topKLogits
-            {
-                biasHoldsFrame = bias.apply(
-                    label: &label, score: &score, topKIds: ids, topKLogits: logits, state: &biasState)
-            }
-
-            Self.tokenLanguageFilter(
-                label: &label,
-                score: &score,
-                topKIds: decision.topKIds,
-                topKLogits: decision.topKLogits,
-                language: language,
-                vocabulary: vocabulary,
-                blankId: blankId
-            )
-            if Self.englishBlocklistApplies(to: language),
-                let ids = decision.topKIds, let logits = decision.topKLogits, let vocab = vocabulary
-            {
-                Self.applyEnglishBlocklist(
-                    label: &label, score: &score,
-                    topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
-            }
-
-            // Map duration bin to actual frame count
-            // durationBins typically = [0,1,2,3,4] meaning skip 0-4 frames
-            var duration = try TdtDurationMapping.mapDurationBin(
-                decision.durationBin, durationBins: config.tdtConfig.durationBins)
-            var blankMask = (label == blankId)  // Is this a blank (silence) token?
-
-            let currentTimeIndex = timeIndices
-            // Prevent repeated non-blank emissions at the same frame when duration=0.
-            if !blankMask && duration == 0
-                && currentTimeIndex == lastEmissionTimestamp
-                && emissionsAtThisTimestamp >= 1
-            {
-                duration = 1
-            }
-            // Hold-frame wins over that guard: a flip to a shorter piece must decode the audio it did
-            // not spell, even at a frame that already emitted. The force-blank cap below still bounds
-            // the emissions at one frame.
-            if biasHoldsFrame { duration = 0 }
-
-            // Prevent infinite loops when blank has duration=0.
-            if blankMask && duration == 0 {
-                duration = 1
-            }
-
-            // Advance through audio frames based on predicted duration
-            timeIndicesCurrentLabels = timeIndices  // Remember where this token was emitted
-            timeIndices += duration  // Jump forward by predicted duration
-            safeTimeIndices = min(timeIndices, lastTimestep)  // Bounds check
-
-            activeMask = timeIndices < effectiveSequenceLength  // Continue if more frames
-            var advanceMask = activeMask && blankMask  // Enter inner loop for blank tokens
-
-            // ===== INNER LOOP: OPTIMIZED BLANK PROCESSING =====
-            // When we predict a blank token, we enter this loop to quickly skip
-            // through consecutive silence/non-speech frames.
-            //
-            // IMPORTANT DESIGN DECISION:
-            // We intentionally REUSE decoderResult.output from outside the loop.
-            // This is NOT a bug - it's a key optimization based on the principle that
-            // blank tokens (silence) should not change the language model context.
-            //
-            // Why this works:
-            // - Blanks represent absence of speech, not linguistic content
-            // - The decoder LSTM tracks language context (what words came before)
-            // - Silence doesn't change what words were spoken
-            // - So we keep the same decoder state until we find actual speech
-            //
-            // This optimization:
-            // - Avoids expensive LSTM computations for silence frames
-            // - Maintains linguistic continuity across gaps in speech
-            // - Speeds up processing by 2-3x for audio with silence
-            while advanceMask {
+        // A rollback returns to its point and decodes on from there, through the flush again.
+        decodeChunk: while true {
+            // ===== MAIN DECODING LOOP =====
+            // Process each encoder frame until we've consumed all audio
+            decodeSteps: while activeMask {
                 try Task.checkCancellation()
-                timeIndicesCurrentLabels = timeIndices
+                if watchesFlips && rollbacks < Self.maxRollbacks {
+                    let lstm = hypothesis.decState ?? decoderState
+                    // A step with no cached projection runs the LSTM before it decides, in place: copy now.
+                    let runsLSTMFirst = decoderState.predictorOutput == nil
+                    stepStart = RollbackPoint(
+                        hypothesis: hypothesis, predictorOutput: decoderState.predictorOutput,
+                        hidden: runsLSTMFirst ? try Self.copy(lstm.hiddenState) : lstm.hiddenState,
+                        cell: runsLSTMFirst ? try Self.copy(lstm.cellState) : lstm.cellState,
+                        arraysCopied: runsLSTMFirst,
+                        timeIndices: timeIndices, safeTimeIndices: safeTimeIndices, activeMask: activeMask,
+                        timeIndicesCurrentLabels: timeIndicesCurrentLabels,
+                        lastEmissionTimestamp: lastEmissionTimestamp,
+                        emissionsAtThisTimestamp: emissionsAtThisTimestamp,
+                        tokensProcessedThisChunk: tokensProcessedThisChunk, biasState: biasState)
+                } else {
+                    stepStart = nil
+                }
+                // Past the last rollback point a flip could not be undone, so the bias flips no more.
+                let biasActs = !watchesFlips || stepStart != nil
+                // Use last emitted token for decoder context, or blank if starting
+                var label = hypothesis.lastToken ?? config.tdtConfig.blankId
+                let stateToUse = hypothesis.decState ?? decoderState
 
-                // INTENTIONAL: Reusing prepared decoder step from outside loop
-                let innerDecision = try modelInference.runJointPrepared(
+                // Get decoder output (LSTM hidden state projection)
+                // OPTIMIZATION: Use cached output if available to avoid redundant computation
+                // This cache is valid when decoder state hasn't changed
+                let decoderResult: (output: MLFeatureProvider, newState: TdtDecoderState)
+                if let cached = decoderState.predictorOutput {
+                    // Reuse cached decoder output - significant speedup
+                    let provider = try MLDictionaryFeatureProvider(dictionary: [
+                        "decoder": MLFeatureValue(multiArray: cached)
+                    ])
+                    decoderResult = (output: provider, newState: stateToUse)
+                } else {
+                    // No cache - run decoder LSTM
+                    decoderResult = try modelInference.runDecoder(
+                        token: label,
+                        state: stateToUse,
+                        model: decoderModel,
+                        targetArray: reusableTargetArray,
+                        targetLengthArray: reusableTargetLengthArray
+                    )
+                }
+
+                // Prepare decoder projection once and reuse for inner blank loop
+                let decoderProjection = try extractFeatureValue(
+                    from: decoderResult.output, key: "decoder", errorMessage: "Invalid decoder output")
+                try modelInference.normalizeDecoderProjection(decoderProjection, into: reusableDecoderStep)
+
+                // Run joint network with preallocated inputs
+                let decision = try modelInference.runJointPrepared(
                     encoderFrames: encoderFrames,
                     timeIndex: safeTimeIndices,
                     preparedDecoderStep: reusableDecoderStep,
@@ -386,216 +340,220 @@ internal struct TdtDecoderV3: Sendable {
                     needsTopK: needsTopK
                 )
 
-                label = innerDecision.token
-                score = TdtDurationMapping.clampProbability(innerDecision.probability)
+                // Predict token (what to emit) and duration (how many frames to skip)
+                label = decision.token
+                var score = TdtDurationMapping.clampProbability(decision.probability)
 
-                var innerHoldsFrame = false
-                if let bias = vocabularyBias, label != blankId,
-                    let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits
+                let blankId = config.tdtConfig.blankId  // 8192 for v3 models
+
+                // Vocabulary bias, before the script filter. Never past a blank argmax.
+                var biasHoldsFrame = false
+                var flipped = false
+                if let bias = vocabularyBias, biasActs, label != blankId,
+                    let ids = decision.topKIds, let logits = decision.topKLogits
                 {
-                    innerHoldsFrame = bias.apply(
+                    let plain = label
+                    biasHoldsFrame = bias.apply(
                         label: &label, score: &score, topKIds: ids, topKLogits: logits, state: &biasState)
+                    flipped = label != plain
                 }
 
                 Self.tokenLanguageFilter(
                     label: &label,
                     score: &score,
-                    topKIds: innerDecision.topKIds,
-                    topKLogits: innerDecision.topKLogits,
+                    topKIds: decision.topKIds,
+                    topKLogits: decision.topKLogits,
                     language: language,
                     vocabulary: vocabulary,
                     blankId: blankId
                 )
                 if Self.englishBlocklistApplies(to: language),
-                    let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits,
-                    let vocab = vocabulary
+                    let ids = decision.topKIds, let logits = decision.topKLogits, let vocab = vocabulary
                 {
                     Self.applyEnglishBlocklist(
                         label: &label, score: &score,
                         topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
                 }
 
-                duration = try TdtDurationMapping.mapDurationBin(
-                    innerDecision.durationBin, durationBins: config.tdtConfig.durationBins)
-                if innerHoldsFrame { duration = 0 }
+                // Map duration bin to actual frame count
+                // durationBins typically = [0,1,2,3,4] meaning skip 0-4 frames
+                var duration = try TdtDurationMapping.mapDurationBin(
+                    decision.durationBin, durationBins: config.tdtConfig.durationBins)
+                var blankMask = (label == blankId)  // Is this a blank (silence) token?
 
-                blankMask = (label == blankId)
+                let currentTimeIndex = timeIndices
+                // Prevent repeated non-blank emissions at the same frame when duration=0.
+                if !blankMask && duration == 0
+                    && currentTimeIndex == lastEmissionTimestamp
+                    && emissionsAtThisTimestamp >= 1
+                {
+                    duration = 1
+                }
+                // Hold-frame wins over that guard: a flip to a shorter piece must decode the audio it did
+                // not spell, even at a frame that already emitted. The force-blank cap below still bounds
+                // the emissions at one frame.
+                if biasHoldsFrame { duration = 0 }
 
-                // Same duration=0 fix for inner loop.
+                // Prevent infinite loops when blank has duration=0.
                 if blankMask && duration == 0 {
                     duration = 1
                 }
 
-                // Advance by duration regardless of blank/non-blank
-                // This is the ORIGINAL and CORRECT logic
-                timeIndices += duration
-                safeTimeIndices = min(timeIndices, lastTimestep)
-                activeMask = timeIndices < effectiveSequenceLength
-                advanceMask = activeMask && blankMask  // Exit loop if non-blank found
-            }
-            // ===== END INNER LOOP =====
+                // Advance through audio frames based on predicted duration
+                timeIndicesCurrentLabels = timeIndices  // Remember where this token was emitted
+                timeIndices += duration  // Jump forward by predicted duration
+                safeTimeIndices = min(timeIndices, lastTimestep)  // Bounds check
 
-            // Process non-blank token: emit it and update decoder state
-            if activeMask && label != blankId {
-                // Check per-chunk token limit to prevent runaway decoding
-                tokensProcessedThisChunk += 1
-                if tokensProcessedThisChunk > config.tdtConfig.maxTokensPerChunk {
-                    break
-                }
+                activeMask = timeIndices < effectiveSequenceLength  // Continue if more frames
+                var advanceMask = activeMask && blankMask  // Enter inner loop for blank tokens
 
-                let emissionTimestamp = timeIndicesCurrentLabels + globalFrameOffset
-                if Self.shouldEmitToken(
-                    emissionTimestamp: emissionTimestamp,
-                    emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame
-                ) {
-                    // Add token to output sequence
-                    hypothesis.ySequence.append(label)
-                    hypothesis.score += score
-                    hypothesis.timestamps.append(emissionTimestamp)
-                    hypothesis.tokenConfidences.append(score)
-                    hypothesis.tokenDurations.append(duration)
-                } else {
-                    hypothesis.suppressedTokens.append(label)
-                    hypothesis.suppressedTimestamps.append(emissionTimestamp)
-                }
-                hypothesis.lastToken = label  // Remember for next iteration
-                vocabularyBias?.observe(label, state: &biasState)
+                // ===== INNER LOOP: OPTIMIZED BLANK PROCESSING =====
+                // When we predict a blank token, we enter this loop to quickly skip
+                // through consecutive silence/non-speech frames.
+                //
+                // IMPORTANT DESIGN DECISION:
+                // We intentionally REUSE decoderResult.output from outside the loop.
+                // This is NOT a bug - it's a key optimization based on the principle that
+                // blank tokens (silence) should not change the language model context.
+                //
+                // Why this works:
+                // - Blanks represent absence of speech, not linguistic content
+                // - The decoder LSTM tracks language context (what words came before)
+                // - Silence doesn't change what words were spoken
+                // - So we keep the same decoder state until we find actual speech
+                //
+                // This optimization:
+                // - Avoids expensive LSTM computations for silence frames
+                // - Maintains linguistic continuity across gaps in speech
+                // - Speeds up processing by 2-3x for audio with silence
+                while advanceMask {
+                    try Task.checkCancellation()
+                    timeIndicesCurrentLabels = timeIndices
 
-                // CRITICAL: Update decoder LSTM with the new token
-                // This updates the language model context for better predictions
-                // Only non-blank tokens update the decoder - this is key!
-                // NOTE: We update the decoder state regardless of whether we emit the token
-                // to maintain proper language model context across chunk boundaries
-                let step = try modelInference.runDecoder(
-                    token: label,
-                    state: decoderResult.newState,
-                    model: decoderModel,
-                    targetArray: reusableTargetArray,
-                    targetLengthArray: reusableTargetLengthArray
-                )
-                hypothesis.decState = step.newState
-                decoderState.predictorOutput = try extractFeatureValue(
-                    from: step.output, key: "decoder", errorMessage: "Invalid decoder output")
-
-                if timeIndicesCurrentLabels == lastEmissionTimestamp {
-                    emissionsAtThisTimestamp += 1
-                } else {
-                    lastEmissionTimestamp = timeIndicesCurrentLabels
-                    emissionsAtThisTimestamp = 1
-                }
-
-                // Force-blank mechanism: Prevent infinite token emission at same timestamp
-                // If we've emitted too many tokens without advancing frames,
-                // force advancement to prevent getting stuck
-                if emissionsAtThisTimestamp >= maxSymbolsPerStep {
-                    let forcedAdvance = 1
-                    timeIndices = min(timeIndices + forcedAdvance, lastTimestep)
-                    safeTimeIndices = min(timeIndices, lastTimestep)
-                    emissionsAtThisTimestamp = 0
-                    lastEmissionTimestamp = -1
-                }
-            }
-
-            // Update activeMask for next iteration
-            activeMask = timeIndices < effectiveSequenceLength
-        }
-
-        // ===== LAST CHUNK FINALIZATION =====
-        // For the last chunk, ensure we force emission of any pending tokens
-        // Continue processing even after encoder frames are exhausted
-        if isLastChunk {
-
-            var additionalSteps = 0
-            var consecutiveBlanks = 0
-            let maxConsecutiveBlanks = config.tdtConfig.consecutiveBlankLimit
-            var lastToken = hypothesis.lastToken ?? config.tdtConfig.blankId
-            var finalProcessingTimeIndices = timeIndices
-
-            // Continue until we get consecutive blanks or hit max steps
-            while additionalSteps < maxSymbolsPerStep && consecutiveBlanks < maxConsecutiveBlanks {
-                try Task.checkCancellation()
-                let stateToUse = hypothesis.decState ?? decoderState
-
-                // Get decoder output for final processing
-                let decoderResult: (output: MLFeatureProvider, newState: TdtDecoderState)
-                if let cached = decoderState.predictorOutput {
-                    let provider = try MLDictionaryFeatureProvider(dictionary: [
-                        "decoder": MLFeatureValue(multiArray: cached)
-                    ])
-                    decoderResult = (output: provider, newState: stateToUse)
-                } else {
-                    decoderResult = try modelInference.runDecoder(
-                        token: lastToken,
-                        state: stateToUse,
-                        model: decoderModel,
-                        targetArray: reusableTargetArray,
-                        targetLengthArray: reusableTargetLengthArray
+                    // INTENTIONAL: Reusing prepared decoder step from outside loop
+                    let innerDecision = try modelInference.runJointPrepared(
+                        encoderFrames: encoderFrames,
+                        timeIndex: safeTimeIndices,
+                        preparedDecoderStep: reusableDecoderStep,
+                        model: jointModel,
+                        encoderStep: reusableEncoderStep,
+                        encoderDestPtr: encDestPtr,
+                        encoderDestStride: encDestStride,
+                        inputProvider: jointInput,
+                        tokenIdBacking: tokenIdBacking,
+                        tokenProbBacking: tokenProbBacking,
+                        durationBacking: durationBacking,
+                        needsTopK: needsTopK
                     )
+
+                    label = innerDecision.token
+                    score = TdtDurationMapping.clampProbability(innerDecision.probability)
+
+                    var innerHoldsFrame = false
+                    if let bias = vocabularyBias, biasActs, label != blankId,
+                        let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits
+                    {
+                        let plain = label
+                        innerHoldsFrame = bias.apply(
+                            label: &label, score: &score, topKIds: ids, topKLogits: logits, state: &biasState)
+                        flipped = label != plain
+                    }
+
+                    Self.tokenLanguageFilter(
+                        label: &label,
+                        score: &score,
+                        topKIds: innerDecision.topKIds,
+                        topKLogits: innerDecision.topKLogits,
+                        language: language,
+                        vocabulary: vocabulary,
+                        blankId: blankId
+                    )
+                    if Self.englishBlocklistApplies(to: language),
+                        let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits,
+                        let vocab = vocabulary
+                    {
+                        Self.applyEnglishBlocklist(
+                            label: &label, score: &score,
+                            topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
+                    }
+
+                    duration = try TdtDurationMapping.mapDurationBin(
+                        innerDecision.durationBin, durationBins: config.tdtConfig.durationBins)
+                    if innerHoldsFrame { duration = 0 }
+
+                    blankMask = (label == blankId)
+
+                    // Same duration=0 fix for inner loop.
+                    if blankMask && duration == 0 {
+                        duration = 1
+                    }
+
+                    // Advance by duration regardless of blank/non-blank
+                    // This is the ORIGINAL and CORRECT logic
+                    timeIndices += duration
+                    safeTimeIndices = min(timeIndices, lastTimestep)
+                    activeMask = timeIndices < effectiveSequenceLength
+                    advanceMask = activeMask && blankMask  // Exit loop if non-blank found
                 }
+                // ===== END INNER LOOP =====
 
-                // Use sliding window approach: try different frames near the boundary
-                // to capture tokens that might be emitted at frame boundaries
-                let frameVariations = [
-                    min(finalProcessingTimeIndices, encoderFrames.count - 1),
-                    min(effectiveSequenceLength - 1, encoderFrames.count - 1),
-                    min(max(0, effectiveSequenceLength - 2), encoderFrames.count - 1),
-                ]
-                let frameIndex = frameVariations[additionalSteps % frameVariations.count]
-                // Prepare decoder projection into reusable buffer (if not already)
-                let finalProjection = try extractFeatureValue(
-                    from: decoderResult.output, key: "decoder", errorMessage: "Invalid decoder output")
-                try modelInference.normalizeDecoderProjection(finalProjection, into: reusableDecoderStep)
+                // Process non-blank token: emit it and update decoder state
+                if activeMask && label != blankId {
+                    // Check per-chunk token limit to prevent runaway decoding
+                    tokensProcessedThisChunk += 1
+                    if tokensProcessedThisChunk > config.tdtConfig.maxTokensPerChunk {
+                        // A flip on the step the budget ends is never emitted, yet a held frame would
+                        // move where the chunk ends: that step takes its plain argmax. A flip already
+                        // waiting stays waiting, with the rollback point it has.
+                        if watchesFlips, flipped, let start = stepStart {
+                            restore(try Self.keeping(start), vetoing: biasState.decisions - 1)
+                            continue decodeSteps
+                        }
+                        break
+                    }
 
-                let decision = try modelInference.runJointPrepared(
-                    encoderFrames: encoderFrames,
-                    timeIndex: frameIndex,
-                    preparedDecoderStep: reusableDecoderStep,
-                    model: jointModel,
-                    encoderStep: reusableEncoderStep,
-                    encoderDestPtr: encDestPtr,
-                    encoderDestStride: encDestStride,
-                    inputProvider: jointInput,
-                    tokenIdBacking: tokenIdBacking,
-                    tokenProbBacking: tokenProbBacking,
-                    durationBacking: durationBacking,
-                    needsTopK: needsTopK
-                )
-
-                let token = decision.token
-                let score = TdtDurationMapping.clampProbability(decision.probability)
-
-                // Also get duration for proper timestamp calculation
-                let duration = try TdtDurationMapping.mapDurationBin(
-                    decision.durationBin, durationBins: config.tdtConfig.durationBins)
-
-                if token == config.tdtConfig.blankId {
-                    consecutiveBlanks += 1
-                } else {
-                    consecutiveBlanks = 0  // Reset on non-blank
-
-                    let finalTimestamp =
-                        min(finalProcessingTimeIndices, effectiveSequenceLength - 1) + globalFrameOffset
+                    let emissionTimestamp = timeIndicesCurrentLabels + globalFrameOffset
                     if Self.shouldEmitToken(
-                        emissionTimestamp: finalTimestamp,
+                        emissionTimestamp: emissionTimestamp,
                         emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame
                     ) {
-                        // Non-blank token found - emit it
-                        hypothesis.ySequence.append(token)
+                        // Add token to output sequence
+                        hypothesis.ySequence.append(label)
                         hypothesis.score += score
-                        // Use the current processing position for timestamp, ensuring it doesn't exceed bounds
-                        hypothesis.timestamps.append(finalTimestamp)
+                        hypothesis.timestamps.append(emissionTimestamp)
                         hypothesis.tokenConfidences.append(score)
                         hypothesis.tokenDurations.append(duration)
                     } else {
-                        hypothesis.suppressedTokens.append(token)
-                        hypothesis.suppressedTimestamps.append(finalTimestamp)
+                        hypothesis.suppressedTokens.append(label)
+                        hypothesis.suppressedTimestamps.append(emissionTimestamp)
                     }
-                    hypothesis.lastToken = token
-                    vocabularyBias?.observe(token, state: &biasState)
+                    hypothesis.lastToken = label  // Remember for next iteration
+                    if watchesFlips, let bias = vocabularyBias {
+                        switch bias.watch(label, flipped: flipped, canArm: stepStart != nil, state: &biasState) {
+                        case .armed:
+                            if let start = stepStart { rollbackPoint = try Self.keeping(start) }
+                        case .completed:
+                            rollbackPoint = nil
+                        case .broken:
+                            if let point = rollbackPoint {
+                                restore(point)
+                                rollbackPoint = nil
+                                continue decodeSteps
+                            }
+                        case .none:
+                            break
+                        }
+                    } else {
+                        vocabularyBias?.observe(label, state: &biasState)
+                    }
 
-                    // Update decoder state
+                    // CRITICAL: Update decoder LSTM with the new token
+                    // This updates the language model context for better predictions
+                    // Only non-blank tokens update the decoder - this is key!
+                    // NOTE: We update the decoder state regardless of whether we emit the token
+                    // to maintain proper language model context across chunk boundaries
                     let step = try modelInference.runDecoder(
-                        token: token,
+                        token: label,
                         state: decoderResult.newState,
                         model: decoderModel,
                         targetArray: reusableTargetArray,
@@ -604,14 +562,170 @@ internal struct TdtDecoderV3: Sendable {
                     hypothesis.decState = step.newState
                     decoderState.predictorOutput = try extractFeatureValue(
                         from: step.output, key: "decoder", errorMessage: "Invalid decoder output")
-                    lastToken = token
+
+                    if timeIndicesCurrentLabels == lastEmissionTimestamp {
+                        emissionsAtThisTimestamp += 1
+                    } else {
+                        lastEmissionTimestamp = timeIndicesCurrentLabels
+                        emissionsAtThisTimestamp = 1
+                    }
+
+                    // Force-blank mechanism: Prevent infinite token emission at same timestamp
+                    // If we've emitted too many tokens without advancing frames,
+                    // force advancement to prevent getting stuck
+                    if emissionsAtThisTimestamp >= maxSymbolsPerStep {
+                        let forcedAdvance = 1
+                        timeIndices = min(timeIndices + forcedAdvance, lastTimestep)
+                        safeTimeIndices = min(timeIndices, lastTimestep)
+                        emissionsAtThisTimestamp = 0
+                        lastEmissionTimestamp = -1
+                    }
                 }
 
-                // Advance processing position by predicted duration, but clamp to bounds
-                finalProcessingTimeIndices = min(finalProcessingTimeIndices + max(1, duration), effectiveSequenceLength)
-                additionalSteps += 1
+                // Update activeMask for next iteration
+                activeMask = timeIndices < effectiveSequenceLength
             }
 
+            // ===== LAST CHUNK FINALIZATION =====
+            // For the last chunk, ensure we force emission of any pending tokens
+            // Continue processing even after encoder frames are exhausted
+            if isLastChunk {
+
+                var additionalSteps = 0
+                var consecutiveBlanks = 0
+                let maxConsecutiveBlanks = config.tdtConfig.consecutiveBlankLimit
+                var lastToken = hypothesis.lastToken ?? config.tdtConfig.blankId
+                var finalProcessingTimeIndices = timeIndices
+
+                // Continue until we get consecutive blanks or hit max steps
+                while additionalSteps < maxSymbolsPerStep && consecutiveBlanks < maxConsecutiveBlanks {
+                    try Task.checkCancellation()
+                    let stateToUse = hypothesis.decState ?? decoderState
+
+                    // Get decoder output for final processing
+                    let decoderResult: (output: MLFeatureProvider, newState: TdtDecoderState)
+                    if let cached = decoderState.predictorOutput {
+                        let provider = try MLDictionaryFeatureProvider(dictionary: [
+                            "decoder": MLFeatureValue(multiArray: cached)
+                        ])
+                        decoderResult = (output: provider, newState: stateToUse)
+                    } else {
+                        decoderResult = try modelInference.runDecoder(
+                            token: lastToken,
+                            state: stateToUse,
+                            model: decoderModel,
+                            targetArray: reusableTargetArray,
+                            targetLengthArray: reusableTargetLengthArray
+                        )
+                    }
+
+                    // Use sliding window approach: try different frames near the boundary
+                    // to capture tokens that might be emitted at frame boundaries
+                    let frameVariations = [
+                        min(finalProcessingTimeIndices, encoderFrames.count - 1),
+                        min(effectiveSequenceLength - 1, encoderFrames.count - 1),
+                        min(max(0, effectiveSequenceLength - 2), encoderFrames.count - 1),
+                    ]
+                    let frameIndex = frameVariations[additionalSteps % frameVariations.count]
+                    // Prepare decoder projection into reusable buffer (if not already)
+                    let finalProjection = try extractFeatureValue(
+                        from: decoderResult.output, key: "decoder", errorMessage: "Invalid decoder output")
+                    try modelInference.normalizeDecoderProjection(finalProjection, into: reusableDecoderStep)
+
+                    let decision = try modelInference.runJointPrepared(
+                        encoderFrames: encoderFrames,
+                        timeIndex: frameIndex,
+                        preparedDecoderStep: reusableDecoderStep,
+                        model: jointModel,
+                        encoderStep: reusableEncoderStep,
+                        encoderDestPtr: encDestPtr,
+                        encoderDestStride: encDestStride,
+                        inputProvider: jointInput,
+                        tokenIdBacking: tokenIdBacking,
+                        tokenProbBacking: tokenProbBacking,
+                        durationBacking: durationBacking,
+                        needsTopK: needsTopK
+                    )
+
+                    let token = decision.token
+                    let score = TdtDurationMapping.clampProbability(decision.probability)
+
+                    // Also get duration for proper timestamp calculation
+                    let duration = try TdtDurationMapping.mapDurationBin(
+                        decision.durationBin, durationBins: config.tdtConfig.durationBins)
+
+                    if token == config.tdtConfig.blankId {
+                        consecutiveBlanks += 1
+                    } else {
+                        consecutiveBlanks = 0  // Reset on non-blank
+
+                        let finalTimestamp =
+                            min(finalProcessingTimeIndices, effectiveSequenceLength - 1) + globalFrameOffset
+                        if Self.shouldEmitToken(
+                            emissionTimestamp: finalTimestamp,
+                            emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame
+                        ) {
+                            // Non-blank token found - emit it
+                            hypothesis.ySequence.append(token)
+                            hypothesis.score += score
+                            // Use the current processing position for timestamp, ensuring it doesn't exceed bounds
+                            hypothesis.timestamps.append(finalTimestamp)
+                            hypothesis.tokenConfidences.append(score)
+                            hypothesis.tokenDurations.append(duration)
+                        } else {
+                            hypothesis.suppressedTokens.append(token)
+                            hypothesis.suppressedTimestamps.append(finalTimestamp)
+                        }
+                        hypothesis.lastToken = token
+                        if watchesFlips, let bias = vocabularyBias {
+                            // Nothing is chosen here, so nothing arms; a match broken here is undone at once,
+                            // before a later token could complete another term.
+                            switch bias.watch(token, flipped: false, canArm: false, state: &biasState) {
+                            case .completed:
+                                rollbackPoint = nil
+                            case .broken:
+                                if let point = rollbackPoint {
+                                    restore(point)
+                                    rollbackPoint = nil
+                                    continue decodeChunk
+                                }
+                            case .armed, .none:
+                                break
+                            }
+                        } else {
+                            vocabularyBias?.observe(token, state: &biasState)
+                        }
+
+                        // Update decoder state
+                        let step = try modelInference.runDecoder(
+                            token: token,
+                            state: decoderResult.newState,
+                            model: decoderModel,
+                            targetArray: reusableTargetArray,
+                            targetLengthArray: reusableTargetLengthArray
+                        )
+                        hypothesis.decState = step.newState
+                        decoderState.predictorOutput = try extractFeatureValue(
+                            from: step.output, key: "decoder", errorMessage: "Invalid decoder output")
+                        lastToken = token
+                    }
+
+                    // Advance processing position by predicted duration, but clamp to bounds
+                    finalProcessingTimeIndices = min(
+                        finalProcessingTimeIndices + max(1, duration), effectiveSequenceLength)
+                    additionalSteps += 1
+                }
+            }
+
+            // A flip still waiting when the chunk ends never completed its term.
+            if biasState.pendingFlip != nil, let point = rollbackPoint {
+                restore(point)
+                rollbackPoint = nil
+                continue decodeChunk
+            }
+            break decodeChunk
+        }
+        if isLastChunk {
             // Finalize decoder state
             decoderState.finalizeLastChunk()
         }
@@ -643,6 +757,43 @@ internal struct TdtDecoderV3: Sendable {
         // the issue #512 Polish samples (0 filter swaps across 7 clips), so no
         // filter call is needed here; post-processing handles deduplication.
         return hypothesis
+    }
+
+    /// A decode rolls back at most this many times per call; past that the bias flips no more.
+    static let maxRollbacks = 64
+
+    /// Where a completion rollback returns to: the loop's values at the top of the step whose flip
+    /// waits for its term, with copies of the LSTM arrays as they stood there.
+    private struct RollbackPoint {
+        var hypothesis: TdtHypothesis
+        var predictorOutput: MLMultiArray?
+        var hidden: MLMultiArray
+        var cell: MLMultiArray
+        var arraysCopied: Bool
+        var timeIndices: Int
+        var safeTimeIndices: Int
+        var activeMask: Bool
+        var timeIndicesCurrentLabels: Int
+        var lastEmissionTimestamp: Int
+        var emissionsAtThisTimestamp: Int
+        var tokensProcessedThisChunk: Int
+        var biasState: TdtVocabularyBias.State
+    }
+
+    /// `point` with its own copies of the LSTM arrays, which the decoder is about to write in place.
+    private static func keeping(_ point: RollbackPoint) throws -> RollbackPoint {
+        guard !point.arraysCopied else { return point }
+        var kept = point
+        kept.hidden = try copy(point.hidden)
+        kept.cell = try copy(point.cell)
+        kept.arraysCopied = true
+        return kept
+    }
+
+    private static func copy(_ array: MLMultiArray) throws -> MLMultiArray {
+        let copied = try MLMultiArray(shape: array.shape, dataType: array.dataType)
+        copied.copyData(from: array)
+        return copied
     }
 
     internal static func shouldEmitToken(

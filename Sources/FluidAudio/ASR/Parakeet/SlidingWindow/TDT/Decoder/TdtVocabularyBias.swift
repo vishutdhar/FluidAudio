@@ -1,6 +1,6 @@
 // Koegaki change notice (Apache License 2.0, section 4(b)): this file was added for Koegaki on
 // branch koegaki-bias of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: the decode-time
-// vocabulary bias for the TDT v3 greedy decoder.
+// vocabulary bias for the TDT v3 greedy decoder, and its completion rollback.
 
 import Foundation
 
@@ -31,6 +31,10 @@ import Foundation
 ///   that continues a shorter live match or opens a word earns the graph score less what the
 ///   deepest match has accumulated; a token that continues nothing pays the accumulated score
 ///   back. The accumulated score is the bonus times the tokens the deepest match has consumed.
+///
+/// With `completionRollback` (contextGraph only, in a decode with no language set) a flip is kept
+/// only if a listed word that holds it completes: the decoder returns to the step of the match's first flip when no live match reaches
+/// back to it any more, or the chunk ends first, and takes the plain argmax there.
 public struct TdtVocabularyBias: Sendable {
 
     public enum Shape: String, Sendable, CaseIterable {
@@ -48,7 +52,29 @@ public struct TdtVocabularyBias: Sendable {
         /// pieceGraph: the payback a token that continues nothing would pay.
         var cachedPayback: Float = 0
         var graphNode: Int = 0
+        /// The steps `apply` has decided in this decode, which name a step across a rollback.
+        var decisions: Int = 0
+        /// completionRollback: the step of the first flip of a match whose term has not completed.
+        var pendingFlip: Int? = nil
+        /// completionRollback: the tokens committed from that flip through the last one.
+        var pendingSpan: Int = 0
+        /// completionRollback: the steps rollbacks vetoed, which keep their plain argmax. Every veto
+        /// stays, so a step is never flipped again whatever later rollbacks return to.
+        var vetoedDecisions: Set<Int> = []
         public init() {}
+    }
+
+    /// What a committed token does to a flip that waits for its term (`completionRollback`).
+    enum FlipWatch: Equatable {
+        /// Nothing waits, or the match goes on.
+        case none
+        /// This token is a flip whose term has not completed: the decoder keeps a rollback point.
+        case armed
+        /// A term that holds the first flip completed: every flip in the match stays.
+        case completed
+        /// No live match reaches back to the first flip, so no term that holds it can complete: the
+        /// decoder returns to it.
+        case broken
     }
 
     public let shape: Shape
@@ -60,6 +86,11 @@ public struct TdtVocabularyBias: Sendable {
     /// frame (duration 0) instead of jumping the plain token's duration, so the audio the shorter
     /// piece did not spell is still decoded.
     public let holdFrameOnShorterFlip: Bool
+    /// Keep a flip only if a listed word that holds it completes; otherwise the decoder returns to the
+    /// step of the match's first flip and takes the plain argmax there (contextGraph only: the other
+    /// shapes track no term and ignore it; and only in a decode with no language set, since the script
+    /// filter that a language turns on runs after the bias and can replace a flip).
+    public let completionRollback: Bool
     let blankId: Int
     private let lettersById: [Int: Int]
     private let trie: PieceTrieIndex?
@@ -78,10 +109,12 @@ public struct TdtVocabularyBias: Sendable {
         boost: Float,
         shape: Shape,
         freshStartMinLetters: Int = 2,
-        holdFrameOnShorterFlip: Bool = false
+        holdFrameOnShorterFlip: Bool = false,
+        completionRollback: Bool = false
     ) {
         guard boost > 0 else { return nil }
         self.holdFrameOnShorterFlip = holdFrameOnShorterFlip
+        self.completionRollback = completionRollback
         self.shape = shape
         self.boost = boost
         self.blankId = blankId
@@ -107,6 +140,9 @@ public struct TdtVocabularyBias: Sendable {
     }
 
     public func makeState() -> State { State() }
+
+    /// The decoder keeps rollback points for this bias.
+    var watchesFlips: Bool { completionRollback && graph != nil }
 
     /// Record a committed non-blank token (emitted or suppressed: the LSTM sees both).
     public func observe(_ tokenId: Int, state: inout State) {
@@ -176,13 +212,18 @@ public struct TdtVocabularyBias: Sendable {
     }
 
     /// Applies `select` to a decode step, recomputing the score of a flipped token as its top-K
-    /// softmax (the convention `applyEnglishBlocklist` uses).
+    /// softmax (the convention `applyEnglishBlocklist` uses). The step a rollback returned to keeps
+    /// its plain argmax.
     /// - Returns: true when the decoder should hold the frame (`holdFrameOnShorterFlip`).
     @discardableResult
     func apply(
         label: inout Int, score: inout Float, topKIds: [Int], topKLogits: [Float], state: inout State
     ) -> Bool {
-        guard let picked = select(plain: label, topKIds: topKIds, topKLogits: topKLogits, state: &state) else {
+        let decision = state.decisions
+        state.decisions += 1
+        guard !state.vetoedDecisions.contains(decision),
+            let picked = select(plain: label, topKIds: topKIds, topKLogits: topKLogits, state: &state)
+        else {
             return false
         }
         let hold =
@@ -198,6 +239,36 @@ public struct TdtVocabularyBias: Sendable {
         for l in topKLogits { sumExp += expf(l - maxLogit) }
         score = sumExp > 0 ? expf(picked.logit - maxLogit) / sumExp : 0
         return hold
+    }
+
+    /// `observe` for `completionRollback`: records a committed token and reports what it does to a
+    /// flip that waits for its term. `flipped` says the token is this step's flip; `canArm` is false
+    /// where the decoder keeps no rollback point (the last-chunk flush, where nothing flips).
+    func watch(_ tokenId: Int, flipped: Bool, canArm: Bool, state: inout State) -> FlipWatch {
+        guard let graph else {
+            observe(tokenId, state: &state)
+            return .none
+        }
+        let from = state.graphNode
+        let reached = graph.reach(from: from, token: tokenId)
+        let next = graph.forward(from: from, token: tokenId).next
+        state.graphNode = next
+        // Every term that completes here ends at this token; the longest holds the most before it.
+        let completed = graph.longestTermEnding(at: reached)
+        if state.pendingFlip != nil {
+            state.pendingSpan += 1
+            if completed >= state.pendingSpan {
+                state.pendingFlip = nil
+                return .completed
+            }
+            // A term that holds the flip can only complete as an extension of a live match that does.
+            guard graph.depths[next] >= state.pendingSpan else { return .broken }
+            return .none
+        }
+        guard flipped, canArm, completed == 0 else { return .none }
+        state.pendingFlip = state.decisions - 1
+        state.pendingSpan = 1
+        return .armed
     }
 }
 
@@ -445,6 +516,8 @@ struct ContextGraphIndex: Sendable {
 
     let nodes: [Node]
     let boost: Float
+    /// Each node's distance from the root in tokens: the length of the match it stands for.
+    let depths: [Int]
 
     init?(terms: [CustomVocabularyTerm], pieces: PieceTable, boost: Float, freshStartMinLetters: Int) {
         var nodes = [Node(token: -1, tokenScore: 0, nodeScore: 0, outputScore: 0, isEnd: false)]
@@ -516,8 +589,20 @@ struct ContextGraphIndex: Sendable {
                 queue.append(child)
             }
         }
+        var depths = [Int](repeating: 0, count: nodes.count)
+        var order = [0]
+        var next = 0
+        while next < order.count {
+            let node = order[next]
+            next += 1
+            for (_, child) in nodes[node].next {
+                depths[child] = depths[node] + 1
+                order.append(child)
+            }
+        }
         self.nodes = nodes
         self.boost = boost
+        self.depths = depths
     }
 
     /// `ForwardOneStep(state, token, strict_mode: false)`.
@@ -542,6 +627,27 @@ struct ContextGraphIndex: Sendable {
             return (score + outputScore - n.nodeScore, 0, true)
         }
         return (score + nodes[node].outputScore, node, node != 0)
+    }
+
+    /// The node `forward` reaches on `token` before a completed term returns the state to the root.
+    func reach(from state: Int, token: Int) -> Int {
+        if let child = nodes[state].next[token] { return child }
+        var node = nodes[state].fail
+        while nodes[node].next[token] == nil {
+            node = nodes[node].fail
+            if nodes[node].token == -1 { break }
+        }
+        if let child = nodes[node].next[token] { node = child }
+        return node
+    }
+
+    /// The length in tokens of the longest term that ends at `node` (one ends there, or its output
+    /// link reaches one), or 0 when none does.
+    func longestTermEnding(at node: Int) -> Int {
+        guard node != 0 else { return 0 }
+        if nodes[node].isEnd { return depths[node] }
+        let output = nodes[node].output
+        return output >= 0 ? depths[output] : 0
     }
 
     /// What the beam search adds to a path that takes `token` from `state`: the in-place bonus on

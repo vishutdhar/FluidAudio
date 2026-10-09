@@ -131,12 +131,13 @@ public actor AsrManager {
     /// Builds a bias over this manager's loaded piece table.
     public func makeVocabularyBias(
         terms: [CustomVocabularyTerm], boost: Float, shape: TdtVocabularyBias.Shape,
-        freshStartMinLetters: Int = 2, holdFrameOnShorterFlip: Bool = false
+        freshStartMinLetters: Int = 2, holdFrameOnShorterFlip: Bool = false, completionRollback: Bool = false
     ) -> TdtVocabularyBias? {
         let blankId = asrModels?.version.blankId ?? config.tdtConfig.blankId
         return TdtVocabularyBias(
             terms: terms, vocabulary: vocabulary, blankId: blankId, boost: boost, shape: shape,
-            freshStartMinLetters: freshStartMinLetters, holdFrameOnShorterFlip: holdFrameOnShorterFlip)
+            freshStartMinLetters: freshStartMinLetters, holdFrameOnShorterFlip: holdFrameOnShorterFlip,
+            completionRollback: completionRollback)
     }
 
     /// Returns the current transcription progress stream for offline long audio (>240,000 samples / ~15s).
