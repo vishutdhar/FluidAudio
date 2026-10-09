@@ -80,6 +80,7 @@ final class TdtVocabularyBiasRollbackTests: XCTestCase {
     private let york = CustomVocabularyTerm(text: "York", tokenIds: [42])
     private let yorkTimes = CustomVocabularyTerm(text: "York Times", tokenIds: [42, 45])
     private let yorkTimesSquare = CustomVocabularyTerm(text: "York Times Square", tokenIds: [42, 45, 46])
+    private let newYorkTimesSquare = CustomVocabularyTerm(text: "New York Times Square", tokenIds: [41, 42, 45, 46])
 
     private func bias(
         _ terms: [CustomVocabularyTerm]? = nil, rollback: Bool, minLetters: Int = 2
@@ -326,6 +327,28 @@ final class TdtVocabularyBiasRollbackTests: XCTestCase {
             let kept = try await decode(frames: 4, bias: bias(terms, rollback: true), script: script)
             let shipped = try await decode(frames: 4, bias: bias(terms, rollback: false), script: script)
             XCTAssertEqual(kept.hypothesis.ySequence, [41, 42, 45, 46])
+            assertSameDecode(kept, shipped)
+            XCTAssertEqual(kept.decoder.fedTokens, shipped.decoder.fedTokens, "nothing replayed")
+        }
+    }
+
+    /// A shorter term completed through the output link inside a longer match holds the flip: after
+    /// " New", " Jersey" flips to " York". With New York City and York listed, the flip completes York
+    /// by itself; with New York Times Square and York Times listed, " Times" completes York Times.
+    /// Either way the flip stays.
+    func testATermCompletedThroughTheOutputLinkThatHoldsTheFlipKeepsIt() async throws {
+        let script: (Int, Int) -> ScriptedJointStep = { frame, last in
+            switch (frame, last) {
+            case (0, blank): return step(41, 1, [(41, 5)])
+            case (1, 41): return step(44, 1, [(44, 5), (42, 4.5)])
+            case (1, 42): return step(45, 1, [(45, 5)])
+            default: return blankStep()
+            }
+        }
+        for terms in [[newYorkCity, york], [newYorkTimesSquare, yorkTimes]] {
+            let kept = try await decode(frames: 4, bias: bias(terms, rollback: true), script: script)
+            let shipped = try await decode(frames: 4, bias: bias(terms, rollback: false), script: script)
+            XCTAssertEqual(kept.hypothesis.ySequence, [41, 42, 45])
             assertSameDecode(kept, shipped)
             XCTAssertEqual(kept.decoder.fedTokens, shipped.decoder.fedTokens, "nothing replayed")
         }
