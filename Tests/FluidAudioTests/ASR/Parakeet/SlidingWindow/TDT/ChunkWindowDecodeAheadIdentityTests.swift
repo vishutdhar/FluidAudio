@@ -6,6 +6,7 @@
 import AVFoundation
 import Foundation
 import XCTest
+import os
 
 @testable import FluidAudio
 
@@ -15,8 +16,11 @@ import XCTest
 /// fresh, and the results compare token by token (ids, times, confidences, text). Two windows are also
 /// decoded at once on the same manager, against their sequential decodes. Koegaki's own gate
 /// (`DecodeAheadIdentityTests`, LibriSpeech holds of 16 to 300 s, bit for bit) is the broader proof;
-/// this keeps the fork honest on its own. Skipped without a model folder: set FLUIDAUDIO_MODELS_DIR to
-/// a folder holding the Ultra set (Preprocessor, Encoder, Decoder, JointDecision and the vocabulary).
+/// this keeps the fork honest on its own. Not shown here: a seam-gap repair that actually runs (it needs
+/// the decoder to miss half a second of speech between two tokens, which these fixtures do not provoke);
+/// the repair runs after the merge, on the same manager, whether a window was answered or decoded.
+/// Skipped without a model folder: set FLUIDAUDIO_MODELS_DIR to a folder holding the Ultra set
+/// (Preprocessor, Encoder, Decoder, JointDecision and the vocabulary).
 final class ChunkWindowDecodeAheadIdentityTests: XCTestCase {
 
     private static let fixtures = [
@@ -91,18 +95,20 @@ final class ChunkWindowDecodeAheadIdentityTests: XCTestCase {
         let answers = ahead
         for answered in 1...min(3, ready.count) {
             let held = Set(ready.prefix(answered))
-            let asked = Asked()
+            let asked = OSAllocatedUnfairLock(initialState: Set<ChunkWindow>())
             let released = Tokens(
                 try await ChunkProcessor(audioSamples: audio).process(
                     using: manager, startTime: Date(),
                     decodedWindows: { window, samples in
-                        asked.add(window)
+                        asked.withLock { _ = $0.insert(window) }
                         guard held.contains(window) else { return nil }
-                        XCTAssertEqual(samples, Array(audio[window.sampleOffset..<(window.sampleOffset + window.sampleCount)]))
+                        XCTAssertEqual(
+                            samples, Array(audio[window.sampleOffset..<(window.sampleOffset + window.sampleCount)]))
                         return answers[window]
                     }))
             XCTAssertEqual(released, oneShot, "\(answered) window(s) answered: the release is not the one-shot decode")
-            XCTAssertTrue(held.isSubset(of: asked.all), "\(answered) window(s) answered: each was asked for")
+            XCTAssertTrue(
+                held.isSubset(of: asked.withLock { $0 }), "\(answered) window(s) answered: each was asked for")
         }
 
         // Two windows decoded at once on the same manager give their sequential decodes.
@@ -113,13 +119,8 @@ final class ChunkWindowDecodeAheadIdentityTests: XCTestCase {
             XCTAssertEqual(a, ahead[ready[0]], "window 0 decoded beside window 1")
             XCTAssertEqual(b, ahead[ready[1]], "window 1 decoded beside window 0")
         }
-        print("decode ahead identity: \(ready.count) windows ready of the recording's plan, \(oneShot.ids.count) tokens, text: \(oneShot.text.prefix(80))")
-    }
-
-    private final class Asked: @unchecked Sendable {
-        private let lock = NSLock()
-        private var windows: Set<ChunkWindow> = []
-        func add(_ window: ChunkWindow) { lock.withLock { _ = windows.insert(window) } }
-        var all: Set<ChunkWindow> { lock.withLock { windows } }
+        print(
+            "decode ahead identity: \(ready.count) windows ready of the recording's plan, \(oneShot.ids.count) tokens, text: \(oneShot.text.prefix(80))"
+        )
     }
 }

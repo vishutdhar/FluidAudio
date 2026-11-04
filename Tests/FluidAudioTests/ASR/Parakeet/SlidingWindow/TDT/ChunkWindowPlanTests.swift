@@ -69,18 +69,27 @@ final class ChunkWindowPlanTests: XCTestCase {
         }
         return [
             ("speech everywhere, 61 s", speech(seconds: 61, seed: 1)),
-            ("a pause near every target, 75 s",
-             silencing(speech(seconds: 75, seed: 2), (1...5).map { (Double($0) * stride - 1.3, 0.45) })),
-            ("pauses at the edges of the search radius, 66 s",
-             silencing(speech(seconds: 66, seed: 3),
-                       (1...4).flatMap { [(Double($0) * stride - 4.05, 0.2), (Double($0) * stride + 3.9, 0.3)] })),
+            (
+                "a pause near every target, 75 s",
+                silencing(speech(seconds: 75, seed: 2), (1...5).map { (Double($0) * stride - 1.3, 0.45) })
+            ),
+            (
+                "pauses at the edges of the search radius, 66 s",
+                silencing(
+                    speech(seconds: 66, seed: 3),
+                    (1...4).flatMap { [(Double($0) * stride - 4.05, 0.2), (Double($0) * stride + 3.9, 0.3)] })
+            ),
             ("random pauses, 82 s", silencing(speech(seconds: 82, seed: 4), randomPauses)),
-            ("quiet speech with one deep pause, 47 s",
-             silencing(speech(seconds: 47, seed: 5, level: 0.004), [(25.5, 1.2)])),
+            (
+                "quiet speech with one deep pause, 47 s",
+                silencing(speech(seconds: 47, seed: 5, level: 0.004), [(25.5, 1.2)])
+            ),
             // Lengths just past a window's end, so a short last window follows.
             ("just past the second window, 28 s", speech(seconds: 14.96 + stride + 0.05, seed: 6)),
-            ("just past the third window, 41 s",
-             silencing(speech(seconds: 14.96 + 2 * stride + 0.01, seed: 8), [(stride + 0.3, 0.5)])),
+            (
+                "just past the third window, 41 s",
+                silencing(speech(seconds: 14.96 + 2 * stride + 0.01, seed: 8), [(stride + 0.3, 0.5)])
+            ),
         ]
     }
 
@@ -113,7 +122,8 @@ final class ChunkWindowPlanTests: XCTestCase {
                 if length <= ASRConstants.maxModelSamples {
                     XCTAssertTrue(marked.isEmpty, "\(name): \(length) samples decode as one window, so none is ready")
                 }
-                XCTAssertEqual(Array(marked.prefix(previous.count)), previous, "\(name): a ready window changed at \(length)")
+                XCTAssertEqual(
+                    Array(marked.prefix(previous.count)), previous, "\(name): a ready window changed at \(length)")
                 for window in marked {
                     guard window.index < full.count else {
                         XCTFail("\(name): window \(window.index) ready at \(length), past the finished plan")
@@ -127,7 +137,8 @@ final class ChunkWindowPlanTests: XCTestCase {
                 step += 1
                 length = ASRConstants.maxModelSamples - 3 * frame + step * frame + (step * 97) % frame
             }
-            XCTAssertEqual(try ready(audio), Array(full.dropLast()), "\(name): every window but the last is ready at the end")
+            XCTAssertEqual(
+                try ready(audio), Array(full.dropLast()), "\(name): every window but the last is ready at the end")
         }
     }
 
@@ -169,9 +180,10 @@ final class ChunkWindowPlanTests: XCTestCase {
 
     /// Tokens a caller holds for `window`: one token a frame into the window, an id named by the index.
     private static func held(_ window: ChunkWindow) -> ChunkWindowTokens {
-        ChunkWindowTokens(tokenIds: [100 + window.index],
-                          timestamps: [window.chunkStart / ASRConstants.samplesPerEncoderFrame + 1],
-                          confidences: [0.5 + Float(window.index) / 100], durations: [1])
+        ChunkWindowTokens(
+            tokenIds: [100 + window.index],
+            timestamps: [window.chunkStart / ASRConstants.samplesPerEncoderFrame + 1],
+            confidences: [0.5 + Float(window.index) / 100], durations: [1])
     }
 
     /// Every window answered: the release asks for each window of its plan, in order, with exactly that
@@ -226,15 +238,21 @@ final class ChunkWindowPlanTests: XCTestCase {
         XCTAssertTrue(none.isEmpty)
         // Past the samples, an empty window, an offset past the end, and an offset whose sum with the
         // count would overflow: each is refused as that, before any decode, with no trap.
-        let past = ChunkWindow(index: 1, sampleOffset: 200_000, sampleCount: 239_360, contextSamples: 0,
-                               chunkStart: 200_000, isLastChunk: false, emitTokensAfterFrame: nil)
-        let empty = ChunkWindow(index: 0, sampleOffset: 0, sampleCount: 0, contextSamples: 0,
-                                chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
-        let beyond = ChunkWindow(index: 0, sampleOffset: one.count + 1, sampleCount: 1, contextSamples: 0,
-                                 chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
-        let overflowing = ChunkWindow(index: 0, sampleOffset: Int.max, sampleCount: 1, contextSamples: 0,
-                                      chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
-        for (name, window) in [("past the samples", past), ("empty", empty), ("beyond the end", beyond), ("overflowing", overflowing)] {
+        let past = ChunkWindow(
+            index: 1, sampleOffset: 200_000, sampleCount: 239_360, contextSamples: 0,
+            chunkStart: 200_000, isLastChunk: false, emitTokensAfterFrame: nil)
+        let empty = ChunkWindow(
+            index: 0, sampleOffset: 0, sampleCount: 0, contextSamples: 0,
+            chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
+        let beyond = ChunkWindow(
+            index: 0, sampleOffset: one.count + 1, sampleCount: 1, contextSamples: 0,
+            chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
+        let overflowing = ChunkWindow(
+            index: 0, sampleOffset: Int.max, sampleCount: 1, contextSamples: 0,
+            chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
+        for (name, window) in [
+            ("past the samples", past), ("empty", empty), ("beyond the end", beyond), ("overflowing", overflowing),
+        ] {
             do {
                 _ = try await manager.decodeChunkWindow(window, of: one)
                 XCTFail("a window \(name) was decoded")
