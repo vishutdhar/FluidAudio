@@ -5,6 +5,7 @@
 
 import Foundation
 import XCTest
+import os
 
 @testable import FluidAudio
 
@@ -170,12 +171,10 @@ final class ChunkWindowPlanTests: XCTestCase {
 
     // MARK: - The release takes windows decoded ahead
 
-    /// Records each window the release asked about, with the samples it was asked with.
-    private final class Asked: @unchecked Sendable {
-        private let lock = NSLock()
-        private var windows: [(ChunkWindow, [Float])] = []
-        func add(_ window: ChunkWindow, _ samples: [Float]) { lock.withLock { windows.append((window, samples)) } }
-        var all: [(ChunkWindow, [Float])] { lock.withLock { windows } }
+    /// One window the release asked about, with the samples it was asked with.
+    private struct Ask: Sendable {
+        let window: ChunkWindow
+        let samples: [Float]
     }
 
     /// Tokens a caller holds for `window`: one token a frame into the window, an id named by the index.
@@ -192,20 +191,22 @@ final class ChunkWindowPlanTests: XCTestCase {
     func testTheReleaseTakesEveryAnsweredWindowAndDecodesNone() async throws {
         let audio = [Float](repeating: 0, count: 40 * rate)
         let manager = AsrManager(config: .default)
-        let asked = Asked()
+        let asked = OSAllocatedUnfairLock(initialState: [Ask]())
         let processor = ChunkProcessor(audioSamples: audio)
         let result = try await processor.process(
             using: manager, startTime: Date(),
             decodedWindows: { window, samples in
-                asked.add(window, samples)
+                asked.withLock { $0.append(Ask(window: window, samples: samples)) }
                 return Self.held(window)
             })
         let melChunkContext = await manager.melChunkContext
         let modelVersion = await manager.modelVersion
         let planned = try processor.plannedWindows(melChunkContext: melChunkContext, modelVersion: modelVersion)
         XCTAssertGreaterThan(planned.count, 2)
-        XCTAssertEqual(asked.all.map(\.0), planned, "asked for each window of the plan, in order")
-        for (window, samples) in asked.all {
+        let asks = asked.withLock { $0 }
+        XCTAssertEqual(asks.map(\.window), planned, "asked for each window of the plan, in order")
+        for ask in asks {
+            let (window, samples) = (ask.window, ask.samples)
             XCTAssertEqual(samples, Array(audio[window.sampleOffset..<(window.sampleOffset + window.sampleCount)]))
         }
         XCTAssertEqual(result.tokenTimings?.map(\.tokenId), planned.map { 100 + $0.index }, "the answers, merged")
