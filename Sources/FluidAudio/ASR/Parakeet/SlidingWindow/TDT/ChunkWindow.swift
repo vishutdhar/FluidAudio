@@ -21,7 +21,9 @@ public struct ChunkWindow: Sendable, Hashable {
     public let chunkStart: Int
     /// Whether this is the plan's last window, decoded to the end of its audio.
     public let isLastChunk: Bool
-    /// The window-local frame before which emitted tokens are suppressed (a backfilled prefix), or nil.
+    /// The recording-global encoder frame (`chunkStart` counted in frames of the whole recording, as the
+    /// decode's `emitTokensAfterGlobalFrame`) before which emitted tokens are suppressed, when the window
+    /// carries a backfilled prefix, or nil. The planner sets it; a window handed back unchanged keeps it.
     public let emitTokensAfterFrame: Int?
 
     public init(

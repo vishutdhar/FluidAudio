@@ -210,7 +210,11 @@ final class ChunkWindowPlanTests: XCTestCase {
                 using: manager, startTime: Date(),
                 decodedWindows: { window, _ in window.index == 1 ? nil : Self.held(window) })
             XCTFail("window 1 was not answered, so it had to be decoded")
-        } catch {}
+        } catch ASRError.notInitialized {
+            // The decode of the one window not answered reached the manager, which has no models.
+        } catch {
+            XCTFail("the unanswered window's decode failed for another reason: \(error)")
+        }
     }
 
     /// The manager's own entry points: no window is ready for one window of audio, and a window decode
@@ -220,11 +224,25 @@ final class ChunkWindowPlanTests: XCTestCase {
         let one = [Float](repeating: 0, count: ASRConstants.maxModelSamples)
         let none = try await manager.readyChunkWindows(in: one)
         XCTAssertTrue(none.isEmpty)
-        let window = ChunkWindow(index: 1, sampleOffset: 200_000, sampleCount: 239_360, contextSamples: 0,
-                                 chunkStart: 200_000, isLastChunk: false, emitTokensAfterFrame: nil)
-        do {
-            _ = try await manager.decodeChunkWindow(window, of: one)
-            XCTFail("a window past the samples was decoded")
-        } catch {}
+        // Past the samples, an empty window, an offset past the end, and an offset whose sum with the
+        // count would overflow: each is refused as that, before any decode, with no trap.
+        let past = ChunkWindow(index: 1, sampleOffset: 200_000, sampleCount: 239_360, contextSamples: 0,
+                               chunkStart: 200_000, isLastChunk: false, emitTokensAfterFrame: nil)
+        let empty = ChunkWindow(index: 0, sampleOffset: 0, sampleCount: 0, contextSamples: 0,
+                                chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
+        let beyond = ChunkWindow(index: 0, sampleOffset: one.count + 1, sampleCount: 1, contextSamples: 0,
+                                 chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
+        let overflowing = ChunkWindow(index: 0, sampleOffset: Int.max, sampleCount: 1, contextSamples: 0,
+                                      chunkStart: 0, isLastChunk: false, emitTokensAfterFrame: nil)
+        for (name, window) in [("past the samples", past), ("empty", empty), ("beyond the end", beyond), ("overflowing", overflowing)] {
+            do {
+                _ = try await manager.decodeChunkWindow(window, of: one)
+                XCTFail("a window \(name) was decoded")
+            } catch ASRError.processingFailed(let why) {
+                XCTAssertTrue(why.contains("reads past the \(one.count) samples"), "\(name): \(why)")
+            } catch {
+                XCTFail("a window \(name) was refused for another reason: \(error)")
+            }
+        }
     }
 }

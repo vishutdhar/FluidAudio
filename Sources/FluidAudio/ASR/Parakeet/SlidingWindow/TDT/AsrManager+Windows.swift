@@ -22,8 +22,10 @@ extension AsrManager {
     public func decodeChunkWindow(
         _ window: ChunkWindow, of samples: [Float], language: Language? = nil
     ) async throws -> ChunkWindowTokens {
-        guard window.sampleOffset >= 0, window.sampleCount > 0,
-            window.sampleOffset + window.sampleCount <= samples.count
+        // Each bound on its own, so a window built by hand with an absurd offset or count is refused
+        // and never overflows the sum.
+        guard window.sampleOffset >= 0, window.sampleOffset <= samples.count, window.sampleCount > 0,
+            window.sampleCount <= samples.count - window.sampleOffset
         else {
             throw ASRError.processingFailed(
                 "window \(window.index) reads past the \(samples.count) samples it was given")
