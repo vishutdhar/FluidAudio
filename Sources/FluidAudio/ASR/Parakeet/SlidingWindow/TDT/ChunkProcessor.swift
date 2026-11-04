@@ -1,3 +1,9 @@
+// Koegaki change notice (Apache License 2.0, section 4(b)): this file was changed for Koegaki on
+// branch koegaki-bias-windows of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: the
+// long-audio loop's windows are planned as a list (`plannedWindows`) that the loop then decodes in order,
+// one window decode (`decodeWindow`) serves the loop and a caller decoding ahead, the windows ready while
+// the recording grows (`readyWindows`), and a caller's already decoded windows (`decodedWindows`).
+
 import Foundation
 
 struct ChunkProcessor {
@@ -452,11 +458,183 @@ struct ChunkProcessor {
         self.init(sampleSource: ArrayAudioSampleSource(samples: audioSamples))
     }
 
+    /// The windows `process` decodes for this recording, in order, on the default (not dual decode
+    /// arbitration) path: the plan its loop used to compute inline, now computed first and then
+    /// dispatched. The last window is the first whose audio reaches the recording's end.
+    func plannedWindows(melChunkContext: Bool, modelVersion: AsrModelVersion?) throws -> [ChunkWindow] {
+        try plan(melChunkContext: melChunkContext, modelVersion: modelVersion).map(\.window)
+    }
+
+    /// The plan, each window with whether its geometry is settled: whether its default window (its start
+    /// and any warm-up prefix, before the end alignment) ends before the recording does. Only then is
+    /// nothing about it read from the recording's end: it is not the last window, and it is not filled
+    /// backwards to the last speech-bearing frame (`lastChunkWarmupSamples`), which a recording ending in
+    /// silence does to a window that is not the last.
+    func plan(
+        melChunkContext: Bool, modelVersion: AsrModelVersion?
+    ) throws -> [(window: ChunkWindow, settled: Bool)] {
+        let layout = chunkLayout(melChunkContext: melChunkContext, modelVersion: modelVersion)
+        let melContextSamples = layout.melContextSamples
+        let warmupPrefixSamples = layout.warmupPrefixSamples
+        let chunkSamples = layout.chunkSamples
+        let strideSamples = layout.strideSamples
+        let chunkStarts = try self.chunkStarts(
+            warmupPrefixSamples: warmupPrefixSamples,
+            chunkSamples: chunkSamples,
+            strideSamples: strideSamples,
+            preferSilenceAlignment: !melChunkContext && modelVersion?.isV3Family == true
+        )
+
+        var windows: [(window: ChunkWindow, settled: Bool)] = []
+        var chunkDecision = chunkStarts.first ?? ChunkStartDecision(start: 0, useWarmupPrefix: false)
+        var chunkStart = chunkDecision.start
+        var chunkIndex = 0
+        let endAligned = Self.supportsSuppressedPrefix(modelVersion)
+        // The final window must end at the last speech-bearing frame, not
+        // EOF — see `speechEndSamples()`.
+        let speechEnd = endAligned ? try speechEndSamples() : totalSamples
+
+        while chunkStart < totalSamples {
+            let defaultWarmupSamples =
+                chunkIndex > 0 && chunkDecision.useWarmupPrefix
+                ? min(warmupPrefixSamples, chunkStart) : 0
+            // A short final chunk fills its window backwards with real
+            // audio instead of zero padding (issue #747); V2-family
+            // decoders can't suppress the prefix and keep the old layout.
+            let warmupSamples =
+                endAligned
+                ? Self.lastChunkWarmupSamples(
+                    chunkStart: chunkStart,
+                    defaultWarmupSamples: defaultWarmupSamples,
+                    chunkSamples: chunkSamples,
+                    totalSamples: totalSamples,
+                    speechEndSamples: speechEnd)
+                : defaultWarmupSamples
+            let visibleChunkSamples = max(
+                ASRConstants.samplesPerEncoderFrame,
+                chunkSamples - warmupSamples
+            )
+            let candidateEnd = chunkStart + visibleChunkSamples
+            let isLastChunk = candidateEnd >= totalSamples
+            let chunkEnd = isLastChunk ? totalSamples : candidateEnd
+
+            if chunkEnd <= chunkStart {
+                break
+            }
+            // The final window's audio stops at the last speech-bearing
+            // frame — a window ending inside a dead-silence run decodes
+            // degenerately. A pure-silence tail has nothing to decode.
+            let audioEnd = isLastChunk && endAligned ? min(chunkEnd, speechEnd) : chunkEnd
+            if audioEnd <= chunkStart {
+                break
+            }
+
+            // In the default path, contextSamples means mel/STFT context
+            // and is skipped by the decoder. In v3/no-mel mode, the
+            // warmup prefix is decoded from frame 0 and only its emitted
+            // tokens are suppressed.
+            let contextSamples = warmupSamples > 0 ? 0 : (chunkIndex > 0 ? melContextSamples : 0)
+            let contextStart = chunkStart - max(warmupSamples, contextSamples)
+            let defaultVisibleSamples = max(ASRConstants.samplesPerEncoderFrame, chunkSamples - defaultWarmupSamples)
+            windows.append(
+                (
+                    window: ChunkWindow(
+                        index: chunkIndex,
+                        sampleOffset: contextStart,
+                        sampleCount: audioEnd - contextStart,
+                        contextSamples: contextSamples,
+                        chunkStart: warmupSamples > 0 ? contextStart : chunkStart,
+                        isLastChunk: isLastChunk,
+                        emitTokensAfterFrame: warmupSamples > 0
+                            ? chunkStart / ASRConstants.samplesPerEncoderFrame : nil
+                    ),
+                    settled: chunkStart + defaultVisibleSamples < totalSamples
+                ))
+            chunkIndex += 1
+
+            if isLastChunk {
+                break
+            }
+
+            if chunkIndex < chunkStarts.count {
+                chunkDecision = chunkStarts[chunkIndex]
+                chunkStart = chunkDecision.start
+            } else {
+                chunkStart += strideSamples
+                chunkDecision = ChunkStartDecision(start: chunkStart, useWarmupPrefix: false)
+            }
+        }
+        return windows
+    }
+
+    /// The settled windows at the start of `samples`' plan, for a recording that is still growing: none
+    /// while it is one window or less (that audio decodes as one padded window), and none under dual
+    /// decode arbitration (which plans its own windows). A settled window's default window ends before
+    /// the recording does, so it ends before any longer recording too: it is never that recording's last
+    /// window nor filled backwards to its end, and the start it was given is final, since each start is
+    /// chosen from the energy within 4 s of its target, which the audio passed at least 10.96 s before
+    /// the window's end. So it is the finished recording's window at its index.
+    static func readyWindows(
+        in samples: [Float], melChunkContext: Bool, modelVersion: AsrModelVersion?, dualDecodeArbitration: Bool
+    ) throws -> [ChunkWindow] {
+        guard samples.count > ASRConstants.maxModelSamples else { return [] }
+        if dualDecodeArbitration, !melChunkContext, modelVersion?.isV3Family == true { return [] }
+        let plan = try ChunkProcessor(audioSamples: samples).plan(melChunkContext: melChunkContext, modelVersion: modelVersion)
+        return plan.prefix { $0.settled }.map(\.window)
+    }
+
+    /// One window decoded on `worker` from a fresh decoder state: the decode `process` gives each window
+    /// it does not already hold, and the one a caller decoding ahead runs. `samples` are the window's own
+    /// (`window.sampleCount` of them, from `window.sampleOffset`).
+    static func decodeWindow(
+        _ window: ChunkWindow,
+        samples: [Float],
+        using worker: AsrManager,
+        decoderLayers: Int,
+        maxModelSamples: Int,
+        language: Language?
+    ) async throws -> [TokenWindow] {
+        var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
+        decoderState.reset()
+
+        let (windowTokens, windowTimestamps, windowConfidences, windowDurations) =
+            try await transcribeChunk(
+                samples: samples,
+                contextSamples: window.contextSamples,
+                chunkStart: window.chunkStart,
+                isLastChunk: window.isLastChunk,
+                using: worker,
+                decoderState: &decoderState,
+                maxModelSamples: maxModelSamples,
+                language: language,
+                emitTokensAfterFrame: window.emitTokensAfterFrame,
+                initialTimeIndexOverride: window.emitTokensAfterFrame == nil ? nil : 0
+            )
+
+        guard
+            windowTokens.count == windowTimestamps.count
+                && windowTokens.count == windowConfidences.count
+        else {
+            throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
+        }
+
+        let durations =
+            windowDurations.count == windowTokens.count
+            ? windowDurations : Array(repeating: 0, count: windowTokens.count)
+
+        return zip(
+            zip(zip(windowTokens, windowTimestamps), windowConfidences), durations
+        ).map {
+            (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
+        }
+    }
+
     func process(
         using manager: AsrManager,
         startTime: Date,
         progressHandler: ((Double) async -> Void)? = nil,
-        language: Language? = nil
+        language: Language? = nil,
+        decodedWindows: ChunkWindowLookup? = nil
     ) async throws -> ASRResult {
         let requestedConcurrency = max(1, await manager.parallelChunkConcurrency)
         let workers = await makeWorkerPool(using: manager, count: requestedConcurrency) ?? [manager]
@@ -483,28 +661,11 @@ struct ChunkProcessor {
             )
         }
 
-        let layout = chunkLayout(melChunkContext: melChunkContext, modelVersion: modelVersion)
-        let melContextSamples = layout.melContextSamples
-        let warmupPrefixSamples = layout.warmupPrefixSamples
-        let chunkSamples = layout.chunkSamples
-        let strideSamples = layout.strideSamples
-        let chunkStarts = try self.chunkStarts(
-            warmupPrefixSamples: warmupPrefixSamples,
-            chunkSamples: chunkSamples,
-            strideSamples: strideSamples,
-            preferSilenceAlignment: !melChunkContext && modelVersion?.isV3Family == true
-        )
+        let windows = try plannedWindows(melChunkContext: melChunkContext, modelVersion: modelVersion)
 
         var chunkOutputs: [[TokenWindow]?] = []
         var availableWorkers = Array(workers.indices)
         var inFlight = 0
-        var chunkDecision = chunkStarts.first ?? ChunkStartDecision(start: 0, useWarmupPrefix: false)
-        var chunkStart = chunkDecision.start
-        var chunkIndex = 0
-        let endAligned = Self.supportsSuppressedPrefix(modelVersion)
-        // The final window must end at the last speech-bearing frame, not
-        // EOF — see `speechEndSamples()`.
-        let speechEnd = endAligned ? try speechEndSamples() : totalSamples
 
         func collectNextResult(
             _ group: inout ThrowingTaskGroup<TaskResult, Error>
@@ -517,122 +678,49 @@ struct ChunkProcessor {
         }
 
         try await withThrowingTaskGroup(of: TaskResult.self) { group in
-            while chunkStart < totalSamples {
+            for window in windows {
                 try Task.checkCancellation()
-                let defaultWarmupSamples =
-                    chunkIndex > 0 && chunkDecision.useWarmupPrefix
-                    ? min(warmupPrefixSamples, chunkStart) : 0
-                // A short final chunk fills its window backwards with real
-                // audio instead of zero padding (issue #747); V2-family
-                // decoders can't suppress the prefix and keep the old layout.
-                let warmupSamples =
-                    endAligned
-                    ? Self.lastChunkWarmupSamples(
-                        chunkStart: chunkStart,
-                        defaultWarmupSamples: defaultWarmupSamples,
-                        chunkSamples: chunkSamples,
-                        totalSamples: totalSamples,
-                        speechEndSamples: speechEnd)
-                    : defaultWarmupSamples
-                let visibleChunkSamples = max(
-                    ASRConstants.samplesPerEncoderFrame,
-                    chunkSamples - warmupSamples
-                )
-                let candidateEnd = chunkStart + visibleChunkSamples
-                let isLastChunk = candidateEnd >= totalSamples
-                let chunkEnd = isLastChunk ? totalSamples : candidateEnd
+                let chunkSamplesArray = try readSamples(offset: window.sampleOffset, count: window.sampleCount)
+                let index = window.index
 
-                if chunkEnd <= chunkStart {
-                    break
-                }
-                // The final window's audio stops at the last speech-bearing
-                // frame — a window ending inside a dead-silence run decodes
-                // degenerately. A pure-silence tail has nothing to decode.
-                let audioEnd = isLastChunk && endAligned ? min(chunkEnd, speechEnd) : chunkEnd
-                if audioEnd <= chunkStart {
-                    break
-                }
+                // A window the caller already decoded, from exactly these samples, is taken as it is;
+                // any other is decoded on a worker.
+                if let held = decodedWindows?(window, chunkSamplesArray), let tokens = held.tokenWindows {
+                    chunkOutputs.append(tokens)
+                } else {
+                    if availableWorkers.isEmpty {
+                        try await collectNextResult(&group)
+                    }
+                    if availableWorkers.isEmpty {
+                        availableWorkers.append(0)
+                    }
 
-                // In the default path, contextSamples means mel/STFT context
-                // and is skipped by the decoder. In v3/no-mel mode, the
-                // warmup prefix is decoded from frame 0 and only its emitted
-                // tokens are suppressed.
-                let contextSamples = warmupSamples > 0 ? 0 : (chunkIndex > 0 ? melContextSamples : 0)
-                let contextStart = chunkStart - max(warmupSamples, contextSamples)
-                let chunkLengthWithContext = audioEnd - contextStart
-                let chunkSamplesArray = try readSamples(offset: contextStart, count: chunkLengthWithContext)
-                let emitTokensAfterFrame =
-                    warmupSamples > 0 ? chunkStart / ASRConstants.samplesPerEncoderFrame : nil
+                    let workerIndex = availableWorkers.removeFirst()
+                    let worker = workers[workerIndex]
+                    chunkOutputs.append(nil)
 
-                if availableWorkers.isEmpty {
-                    try await collectNextResult(&group)
-                }
-                if availableWorkers.isEmpty {
-                    availableWorkers.append(0)
-                }
-
-                let workerIndex = availableWorkers.removeFirst()
-                let worker = workers[workerIndex]
-                let index = chunkIndex
-                let chunkStartOffset = warmupSamples > 0 ? contextStart : chunkStart
-                chunkOutputs.append(nil)
-
-                group.addTask {
-                    var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
-                    decoderState.reset()
-
-                    let (windowTokens, windowTimestamps, windowConfidences, windowDurations) =
-                        try await Self
-                        .transcribeChunk(
+                    group.addTask {
+                        let tokens = try await Self.decodeWindow(
+                            window,
                             samples: chunkSamplesArray,
-                            contextSamples: contextSamples,
-                            chunkStart: chunkStartOffset,
-                            isLastChunk: isLastChunk,
                             using: worker,
-                            decoderState: &decoderState,
+                            decoderLayers: decoderLayers,
                             maxModelSamples: maxModelSamples,
-                            language: language,
-                            emitTokensAfterFrame: emitTokensAfterFrame,
-                            initialTimeIndexOverride: emitTokensAfterFrame == nil ? nil : 0
+                            language: language
                         )
-
-                    guard
-                        windowTokens.count == windowTimestamps.count
-                            && windowTokens.count == windowConfidences.count
-                    else {
-                        throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
+                        return TaskResult(index: index, tokens: tokens, workerIndex: workerIndex)
                     }
-
-                    let durations =
-                        windowDurations.count == windowTokens.count
-                        ? windowDurations : Array(repeating: 0, count: windowTokens.count)
-
-                    let windowData: [TokenWindow] = zip(
-                        zip(zip(windowTokens, windowTimestamps), windowConfidences), durations
-                    ).map {
-                        (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
-                    }
-
-                    return TaskResult(index: index, tokens: windowData, workerIndex: workerIndex)
+                    inFlight += 1
                 }
-                inFlight += 1
-                chunkIndex += 1
 
-                if let progressHandler, !isLastChunk {
+                if let progressHandler, !window.isLastChunk {
+                    let chunkEnd = window.sampleOffset + window.sampleCount
                     let progress = min(1.0, max(0.0, Double(chunkEnd) / Double(totalSamples)))
                     await progressHandler(progress)
                 }
 
-                if isLastChunk {
+                if window.isLastChunk {
                     break
-                }
-
-                if chunkIndex < chunkStarts.count {
-                    chunkDecision = chunkStarts[chunkIndex]
-                    chunkStart = chunkDecision.start
-                } else {
-                    chunkStart += strideSamples
-                    chunkDecision = ChunkStartDecision(start: chunkStart, useWarmupPrefix: false)
                 }
 
                 if availableWorkers.isEmpty && inFlight > 0 {

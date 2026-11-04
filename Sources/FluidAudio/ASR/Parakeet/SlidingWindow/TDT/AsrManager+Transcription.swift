@@ -1,9 +1,14 @@
+// Koegaki change notice (Apache License 2.0, section 4(b)): this file was changed for Koegaki on
+// branch koegaki-bias-windows of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: a
+// long-audio transcription can take the windows its caller already decoded (`decodedWindows`).
+
 import Foundation
 
 extension AsrManager {
 
     internal func transcribeWithState(
-        _ audioSamples: [Float], decoderState: inout TdtDecoderState, language: Language? = nil
+        _ audioSamples: [Float], decoderState: inout TdtDecoderState, language: Language? = nil,
+        decodedWindows: ChunkWindowLookup? = nil
     ) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
         let minimumRequiredSamples = ASRConstants.minimumRequiredSamples(forSampleRate: config.sampleRate)
@@ -46,7 +51,8 @@ extension AsrManager {
                 guard let self else { return }
                 await self.progressEmitter.report(progress: progress)
             },
-            language: language
+            language: language,
+            decodedWindows: decodedWindows
         )
 
         return result

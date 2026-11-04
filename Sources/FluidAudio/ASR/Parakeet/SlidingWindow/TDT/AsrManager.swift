@@ -1,6 +1,7 @@
 // Koegaki change notice (Apache License 2.0, section 4(b)): this file was changed for Koegaki on
 // branch koegaki-bias of github.com/vishutdhar/FluidAudio, based on upstream tag v0.17.5: the decode-time
-// vocabulary bias setter and builder, and worker clones that carry the bias.
+// vocabulary bias setter and builder, and worker clones that carry the bias; and on branch
+// koegaki-bias-windows: a transcription that takes the windows its caller already decoded.
 
 import AVFoundation
 @preconcurrency import CoreML
@@ -531,12 +532,27 @@ public actor AsrManager {
         decoderState: inout TdtDecoderState,
         language: Language? = nil
     ) async throws -> ASRResult {
+        try await transcribe(audioSamples, decoderState: &decoderState, language: language, decodedWindows: nil)
+    }
+
+    /// `transcribe(_:decoderState:language:)`, where a long recording (over `ASRConstants.maxModelSamples`)
+    /// asks `decodedWindows` for each window of its plan before decoding it, and takes the tokens it is
+    /// given in place of its own decode. The caller answers only for a window it decoded from the same
+    /// samples on this manager, with its bias and `language` (`decodeChunkWindow`); everything else, the
+    /// merge and the seam repair included, runs as without it.
+    public func transcribe(
+        _ audioSamples: [Float],
+        decoderState: inout TdtDecoderState,
+        language: Language? = nil,
+        decodedWindows: ChunkWindowLookup?
+    ) async throws -> ASRResult {
         let shouldEmitProgress = audioSamples.count > ASRConstants.maxModelSamples
         if shouldEmitProgress {
             _ = await progressEmitter.ensureSession()
         }
         do {
-            let result = try await transcribeWithState(audioSamples, decoderState: &decoderState, language: language)
+            let result = try await transcribeWithState(
+                audioSamples, decoderState: &decoderState, language: language, decodedWindows: decodedWindows)
 
             if shouldEmitProgress {
                 await progressEmitter.finishSession()
