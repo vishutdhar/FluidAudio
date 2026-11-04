@@ -11,7 +11,7 @@ import os
 @testable import FluidAudio
 
 /// Decode ahead on a real model (Koegaki spec 2026-11-03-mac-decode-ahead, section 6): the three speech
-/// fixtures joined (about 58 s, four windows of the Ultra layout) are decoded one shot, then released
+/// fixtures joined (about 58 s, five windows of the Ultra layout, four ready before the last) are decoded one shot, then released
 /// with their first one, two and three windows answered from `decodeChunkWindow` and the rest decoded
 /// fresh, and the results compare token by token (ids, times, confidences, text). Two windows are also
 /// decoded at once on the same manager, against their sequential decodes. Koegaki's own gate
@@ -22,10 +22,6 @@ import os
 /// Skipped without a model folder: set FLUIDAUDIO_MODELS_DIR to a folder holding the Ultra set
 /// (Preprocessor, Encoder, Decoder, JointDecision and the vocabulary).
 final class ChunkWindowDecodeAheadIdentityTests: XCTestCase {
-
-    private static let fixtures = [
-        "01-validation-request-21.4s", "02-release-readiness-19.8s", "03-diff-explanation-16.9s",
-    ]
 
     private func loadedManager() async throws -> AsrManager {
         guard let folder = ProcessInfo.processInfo.environment["FLUIDAUDIO_MODELS_DIR"] else {
@@ -39,26 +35,9 @@ final class ChunkWindowDecodeAheadIdentityTests: XCTestCase {
         return manager
     }
 
-    private static func samples(of name: String) throws -> [Float] {
-        guard
-            let url = Bundle.module.url(forResource: "Fixtures/\(name)", withExtension: "wav")
-                ?? Bundle.module.url(forResource: name, withExtension: "wav")
-        else { throw XCTSkip("fixture \(name) missing from test bundle") }
-        let file = try AVAudioFile(forReading: url)
-        guard
-            let buffer = AVAudioPCMBuffer(
-                pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length))
-        else { throw XCTSkip("could not allocate a buffer for \(name)") }
-        try file.read(into: buffer)
-        guard let channel = buffer.floatChannelData?[0] else { throw XCTSkip("\(name) is not float PCM") }
-        return Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
-    }
-
-    /// The three fixtures one after another, a third of a second of silence between them.
-    private static func recording() throws -> [Float] {
-        let gap = [Float](repeating: 0, count: ASRConstants.sampleRate / 3)
-        return try fixtures.map(samples(of:)).joined(separator: gap).map { $0 }
-    }
+    /// The three fixtures one after another: about 58 s, five windows of the Ultra layout, four of them
+    /// ready before the last.
+    private static func recording() throws -> [Float] { try ChunkWindowFixtures.allThree() }
 
     private struct Tokens: Equatable {
         let ids: [Int]

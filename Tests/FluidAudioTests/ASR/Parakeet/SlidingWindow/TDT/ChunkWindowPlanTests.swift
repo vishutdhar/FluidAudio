@@ -18,80 +18,12 @@ final class ChunkWindowPlanTests: XCTestCase {
     private let rate = ASRConstants.sampleRate
     private let frame = ASRConstants.samplesPerEncoderFrame
 
-    // MARK: - Synthetic energy profiles
+    // MARK: - The recordings
 
-    /// A deterministic generator, so every profile is the same on every run.
-    private struct Generator {
-        var state: UInt64
-        mutating func next() -> UInt64 {
-            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
-            return state
-        }
-        mutating func unit() -> Float { Float(next() >> 40) / Float(1 << 24) }
-    }
-
-    /// Speech-like audio: noise at a syllable-rate envelope that never goes quiet.
-    private func speech(seconds: Double, seed: UInt64, level: Float = 0.1) -> [Float] {
-        var generator = Generator(state: seed)
-        let count = Int(seconds * Double(rate))
-        return (0..<count).map { n in
-            let envelope = 0.55 + 0.45 * sinf(Float(n) * 2 * .pi * 4 / Float(rate))
-            return level * envelope * (generator.unit() * 2 - 1)
-        }
-    }
-
-    /// `audio` with digital silence over each of `pauses` (start and length in seconds).
-    private func silencing(_ audio: [Float], _ pauses: [(Double, Double)]) -> [Float] {
-        var out = audio
-        for (start, length) in pauses {
-            let from = max(0, Int(start * Double(rate)))
-            let to = min(out.count, Int((start + length) * Double(rate)))
-            if from < to { for n in from..<to { out[n] = 0 } }
-        }
-        return out
-    }
-
-    /// The window targets of the Ultra layout, in seconds: one stride apart.
-    private var strideSeconds: Double {
-        let layout = ChunkProcessor(audioSamples: [Float](repeating: 0, count: rate))
-            .chunkLayoutForTesting(melChunkContext: false, modelVersion: .ultra)
-        return Double(layout.strideSamples) / Double(rate)
-    }
-
-    private func profiles() -> [(name: String, audio: [Float])] {
-        let stride = strideSeconds
-        var randomPauses: [(Double, Double)] = []
-        var generator = Generator(state: 7)
-        var at = 0.5
-        while at < 80 {
-            let length = 0.2 + 0.6 * Double(generator.unit())
-            randomPauses.append((at, length))
-            at += length + 1 + 3 * Double(generator.unit())
-        }
-        return [
-            ("speech everywhere, 61 s", speech(seconds: 61, seed: 1)),
-            (
-                "a pause near every target, 75 s",
-                silencing(speech(seconds: 75, seed: 2), (1...5).map { (Double($0) * stride - 1.3, 0.45) })
-            ),
-            (
-                "pauses at the edges of the search radius, 66 s",
-                silencing(
-                    speech(seconds: 66, seed: 3),
-                    (1...4).flatMap { [(Double($0) * stride - 4.05, 0.2), (Double($0) * stride + 3.9, 0.3)] })
-            ),
-            ("random pauses, 82 s", silencing(speech(seconds: 82, seed: 4), randomPauses)),
-            (
-                "quiet speech with one deep pause, 47 s",
-                silencing(speech(seconds: 47, seed: 5, level: 0.004), [(25.5, 1.2)])
-            ),
-            // Lengths just past a window's end, so a short last window follows.
-            ("just past the second window, 28 s", speech(seconds: 14.96 + stride + 0.05, seed: 6)),
-            (
-                "just past the third window, 41 s",
-                silencing(speech(seconds: 14.96 + 2 * stride + 0.01, seed: 8), [(stride + 0.3, 0.5)])
-            ),
-        ]
+    /// The fixtures joined in every order of two and of three (36.7 to 58.1 s): real speech with its own
+    /// pauses, which fall near a different target in each order.
+    private func recordings() throws -> [(name: String, audio: [Float])] {
+        try ChunkWindowFixtures.joinedRecordings()
     }
 
     private func plan(_ audio: [Float]) throws -> [ChunkWindow] {
@@ -105,12 +37,12 @@ final class ChunkWindowPlanTests: XCTestCase {
 
     // MARK: - Plan stability
 
-    /// For every profile and every prefix length (a frame apart, at a different offset within the frame
+    /// For every recording and every prefix length (a frame apart, at a different offset within the frame
     /// each time), each window the prefix marks ready is the finished recording's window at its index,
     /// is not the finished recording's last window, has its audio complete inside the prefix, and stays
     /// ready as the recording grows.
     func testEveryReadyWindowIsTheFinishedPlansWindow() throws {
-        for (name, audio) in profiles() {
+        for (name, audio) in try recordings() {
             let full = try plan(audio)
             XCTAssertGreaterThan(full.count, 1, name)
             XCTAssertTrue(full.last?.isLastChunk == true && full.dropLast().allSatisfy { !$0.isLastChunk }, name)
@@ -146,7 +78,7 @@ final class ChunkWindowPlanTests: XCTestCase {
     /// The plan is a pure function of the samples it is given: planning the same audio twice gives the
     /// same windows, and the windows tile the recording in order.
     func testThePlanIsInOrderAndRepeatable() throws {
-        for (name, audio) in profiles() {
+        for (name, audio) in try recordings() {
             let first = try plan(audio)
             XCTAssertEqual(first, try plan(audio), name)
             XCTAssertEqual(first.map(\.index), Array(first.indices), name)
@@ -162,7 +94,7 @@ final class ChunkWindowPlanTests: XCTestCase {
     /// Audio of one window or less (240,000 samples) decodes as one padded window, so nothing is ready
     /// however far its plan would go; dual decode arbitration plans its own windows, so none is ready.
     func testNothingIsReadyForOneWindowOrUnderDualDecodeArbitration() throws {
-        let audio = speech(seconds: 40, seed: 9)
+        let audio = try ChunkWindowFixtures.allThree()
         XCTAssertTrue(try ready(Array(audio[..<ASRConstants.maxModelSamples])).isEmpty)
         XCTAssertTrue(try ready(Array(audio[..<(ASRConstants.maxModelSamples - frame)])).isEmpty)
         XCTAssertFalse(try ready(audio).isEmpty)
@@ -177,19 +109,28 @@ final class ChunkWindowPlanTests: XCTestCase {
         let samples: [Float]
     }
 
-    /// Tokens a caller holds for `window`: one token a frame into the window, an id named by the index.
+    /// Tokens a caller holds for `window`: one every 8 frames from a frame into the window through its own
+    /// stride (never into the next window's region or past its own audio), every id named by the index. The
+    /// tokens are dense on purpose: the release's seam-gap repair probes a gap of 1.5 s or more between two
+    /// tokens that holds speech, and these tests run on real speech with a manager that has no models, so
+    /// no gap may reach it.
     private static func held(_ window: ChunkWindow) -> ChunkWindowTokens {
-        ChunkWindowTokens(
-            tokenIds: [100 + window.index],
-            timestamps: [window.chunkStart / ASRConstants.samplesPerEncoderFrame + 1],
-            confidences: [0.5 + Float(window.index) / 100], durations: [1])
+        let frame = ASRConstants.samplesPerEncoderFrame
+        let first = window.chunkStart / frame + 1
+        let last = min(first + 144, (window.sampleOffset + window.sampleCount) / frame - 2)
+        let frames = Array(stride(from: first, through: last, by: 8))
+        return ChunkWindowTokens(
+            tokenIds: frames.map { _ in 100 + window.index },
+            timestamps: frames,
+            confidences: frames.map { _ in 0.5 + Float(window.index) / 100 },
+            durations: frames.map { _ in 1 })
     }
 
     /// Every window answered: the release asks for each window of its plan, in order, with exactly that
     /// window's samples, decodes none (the manager has no models, so a decode would throw), and merges
     /// the answers as it merges decoded windows.
     func testTheReleaseTakesEveryAnsweredWindowAndDecodesNone() async throws {
-        let audio = [Float](repeating: 0, count: 40 * rate)
+        let audio = try ChunkWindowFixtures.allThree()
         let manager = AsrManager(config: .default)
         let asked = OSAllocatedUnfairLock(initialState: [Ask]())
         let processor = ChunkProcessor(audioSamples: audio)
@@ -209,14 +150,15 @@ final class ChunkWindowPlanTests: XCTestCase {
             let (window, samples) = (ask.window, ask.samples)
             XCTAssertEqual(samples, Array(audio[window.sampleOffset..<(window.sampleOffset + window.sampleCount)]))
         }
-        XCTAssertEqual(result.tokenTimings?.map(\.tokenId), planned.map { 100 + $0.index }, "the answers, merged")
-        XCTAssertEqual(result.tokenTimings?.map(\.confidence), planned.map { 0.5 + Float($0.index) / 100 })
+        XCTAssertEqual(
+            result.tokenTimings?.map(\.tokenId), planned.flatMap { Self.held($0).tokenIds }, "the answers, merged")
+        XCTAssertEqual(result.tokenTimings?.map(\.confidence), planned.flatMap { Self.held($0).confidences })
     }
 
     /// A window the caller does not hold is decoded on a worker, as with no caller at all: with no
     /// models loaded that decode throws.
     func testAWindowNotAnsweredIsDecoded() async throws {
-        let audio = [Float](repeating: 0, count: 40 * rate)
+        let audio = try ChunkWindowFixtures.allThree()
         let manager = AsrManager(config: .default)
         do {
             _ = try await ChunkProcessor(audioSamples: audio).process(
@@ -234,7 +176,8 @@ final class ChunkWindowPlanTests: XCTestCase {
     /// refuses a window outside the samples it is given.
     func testTheManagersEntryPoints() async throws {
         let manager = AsrManager(config: .default)
-        let one = [Float](repeating: 0, count: ASRConstants.maxModelSamples)
+        let one = Array(
+            try ChunkWindowFixtures.samples(of: ChunkWindowFixtures.names[0])[..<ASRConstants.maxModelSamples])
         let none = try await manager.readyChunkWindows(in: one)
         XCTAssertTrue(none.isEmpty)
         // Past the samples, an empty window, an offset past the end, and an offset whose sum with the
